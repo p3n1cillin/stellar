@@ -16,9 +16,10 @@ impl App {
         drop(s);
         let temps: HashMap<String, f64> = sensors.iter().filter(|x| x.kind == "Temperature").filter_map(|x| Some((x.id.clone(), x.value?))).collect();
 
-        ui.horizontal(|ui| {
-            heading(ui, "Cooling");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        heading(ui, "Cooling");
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
+            {
                 if tuning.is_none() {
                     let measured = self.committed.fans.iter().any(|r| !r.calibration.is_empty());
                     let b = egui::Button::new(RichText::new(if measured { "Re-run auto-tune" } else { "Auto-tune all fans" }).strong()).fill(VIOLET);
@@ -67,7 +68,7 @@ impl App {
                         }
                     }
                 }
-            });
+            }
         });
         if let Some(c) = competing {
             ui.label(RichText::new(format!("{c} is running, so Stellar leaves every fan on firmware control. Quit it to let Stellar drive fans.")).color(GOLD));
@@ -79,14 +80,15 @@ impl App {
         self.tune_dialog_window(ui.ctx());
         if let Some(t) = &tuning {
             card(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                     ui.label(RichText::new(format!("Auto-tune {} of {}: {} — {}", t.index, t.total, t.name, t.phase)).strong());
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    {
+                        ui.add(egui::ProgressBar::new((t.percent / 100.0) as f32).desired_width(200.0).text(format!("duty {:.0}%", t.percent)).fill(CYAN));
                         if ui.button("Cancel").clicked() {
                             self.send(Cmd::CancelTuning);
                         }
-                        ui.add(egui::ProgressBar::new((t.percent / 100.0) as f32).desired_width(200.0).text(format!("duty {:.0}%", t.percent)).fill(CYAN));
-                    });
+                    }
                 });
                 ui.label(RichText::new("Fans will change speed and briefly stop. Tuning aborts automatically if the CPU or GPU reaches 85°C.").size(12.0).color(MUTED));
             });
@@ -116,57 +118,55 @@ impl App {
         if self.selected.is_none() {
             self.selected = outputs.iter().find(|o| !unused.contains(&o.0)).map(|o| o.0.clone());
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             sub(ui, "FANS");
             if !unused.is_empty() {
                 ui.checkbox(&mut self.show_unused, format!("show {} unused headers", unused.len()));
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            for (id, name, hw) in &outputs {
-                if unused.contains(id) && !self.show_unused {
-                    continue;
-                }
-                let rule = self.draft.rule(id);
-                let duty = sensors.iter().find(|x| &x.id == id).and_then(|x| x.value);
-                let rpm = rpm_of(rule, id);
-                let selected = self.selected.as_deref() == Some(id);
-                let title = rule.map(|r| r.name.clone()).unwrap_or_else(|| name.clone());
-                let mode = rule.map(|r| r.mode);
-                let curve_name = rule.and_then(|r| r.curve.as_ref()).and_then(|c| self.draft.curves.iter().find(|x| &x.id == c)).map(|c| c.name.clone());
-                let emergency = decisions.get(id).is_some_and(|d| d.emergency);
-                let resp = egui::Frame::new()
-                    .fill(if selected { VIOLET.gamma_multiply(0.22) } else { CARD })
-                    .stroke(Stroke::new(1.0, if emergency { BAD } else if selected { VIOLET } else { LINE }))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| ui.vertical(|ui| {
-                        ui.set_width(210.0);
-                        ui.label(RichText::new(&title).strong());
-                        ui.label(RichText::new(short_hw(hw)).size(11.0).color(MUTED));
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(duty.map(|d| format!("{d:.0}%")).unwrap_or("—".into())).size(22.0));
-                            ui.label(RichText::new(rpm.map(|r| format!("{r:.0} RPM")).unwrap_or_default()).color(MUTED));
-                        });
-                        let (text, color) = match mode {
-                            Some(FanMode::Curve) => (format!("Curve · {}", curve_name.unwrap_or_else(|| "?".into())), CYAN),
-                            Some(FanMode::Manual) => ("Manual".to_string(), CYAN),
-                            Some(FanMode::Firmware) => ("Firmware".to_string(), MUTED),
-                            None => ("Not managed".to_string(), MUTED),
-                        };
-                        if tuning.as_ref().is_some_and(|t| &t.control == id) {
-                            chip(ui, "Tuning…", GOLD);
-                        } else {
-                            chip(ui, &text, if emergency { BAD } else { color });
-                        }
-                    }))
-                    .response
-                    .interact(Sense::click());
-                if resp.clicked() {
-                    self.selected = Some(id.clone());
-                }
+        let visible: Vec<&(String, String, String)> = outputs.iter().filter(|(id, ..)| !unused.contains(id) || self.show_unused).collect();
+        let mut clicked = None;
+        tiles(ui, 200.0, visible.len(), |ui, i, w| {
+            let (id, name, hw) = visible[i];
+            let rule = self.draft.rule(id);
+            let duty = sensors.iter().find(|x| &x.id == id).and_then(|x| x.value);
+            let rpm = rpm_of(rule, id);
+            let selected = self.selected.as_deref() == Some(id);
+            let title = rule.map(|r| r.name.clone()).unwrap_or_else(|| name.clone());
+            let mode = rule.map(|r| r.mode);
+            let curve_name = rule.and_then(|r| r.curve.as_ref()).and_then(|c| self.draft.curves.iter().find(|x| &x.id == c)).map(|c| c.name.clone());
+            let emergency = decisions.get(id).is_some_and(|d| d.emergency);
+            let resp = tile_frame(selected, emergency)
+                .show(ui, |ui| ui.vertical(|ui| {
+                    ui.set_width(w - TILE_CHROME);
+                    ui.add(egui::Label::new(RichText::new(&title).strong()).truncate());
+                    ui.add(egui::Label::new(RichText::new(short_hw(hw)).size(11.0).color(MUTED)).truncate());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(duty.map(|d| format!("{d:.0}%")).unwrap_or("—".into())).size(22.0));
+                        ui.label(RichText::new(rpm.map(|r| format!("{r:.0} RPM")).unwrap_or_default()).color(MUTED));
+                    });
+                    let (text, color) = match mode {
+                        Some(FanMode::Curve) => (format!("Curve · {}", curve_name.unwrap_or_else(|| "?".into())), CYAN),
+                        Some(FanMode::Manual) => ("Manual".to_string(), CYAN),
+                        Some(FanMode::Firmware) => ("Firmware".to_string(), MUTED),
+                        None => ("Not managed".to_string(), MUTED),
+                    };
+                    if tuning.as_ref().is_some_and(|t| &t.control == id) {
+                        chip(ui, "Tuning…", GOLD);
+                    } else {
+                        chip(ui, &text, if emergency { BAD } else { color });
+                    }
+                }))
+                .response
+                .interact(Sense::click());
+            if resp.clicked() {
+                clicked = Some(id.clone());
             }
         });
+        if clicked.is_some() {
+            self.selected = clicked;
+        }
         ui.add_space(8.0);
         if let Some(id) = self.selected.clone() {
             self.fan_editor(ui, &id, &sensors, &temps, decisions.get(&id), tuning.is_some() || competing.is_some());
@@ -174,10 +174,11 @@ impl App {
 
         // ---------------------------------------------------------- curves
         ui.add_space(14.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             sub(ui, "CURVES");
             ui.label(RichText::new("Reusable — any number of fans can follow one curve.").size(12.0).color(MUTED));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            {
                 let first_two: Vec<String> = self.draft.curves.iter().take(2).map(|c| c.id.clone()).collect();
                 ui.menu_button("New curve", |ui| {
                     let cpu = crate::cooling::cpu_temperature(&sensors).map(|x| x.id.clone()).or_else(|| temps.keys().next().cloned()).unwrap_or_default();
@@ -207,38 +208,37 @@ impl App {
                         ui.close();
                     }
                 });
-            });
+            }
         });
         if self.draft.curves.is_empty() {
             ui.label(RichText::new("No curves yet. Run Auto-tune to create tuned CPU, GPU and Case curves, or add one.").color(MUTED));
         }
         let mut eval = Evaluator::default();
         let draft_curves = self.draft.curves.clone();
-        ui.horizontal_wrapped(|ui| {
-            for c in &draft_curves {
-                let selected = self.selected_curve.as_deref() == Some(c.id.as_str());
-                let value = eval.eval(&draft_curves, &c.id, &temps);
-                let users = self.draft.fans.iter().filter(|r| r.mode == FanMode::Curve && r.curve.as_deref() == Some(c.id.as_str())).count();
-                let resp = egui::Frame::new()
-                    .fill(if selected { VIOLET.gamma_multiply(0.22) } else { CARD })
-                    .stroke(Stroke::new(1.0, if selected { VIOLET } else { LINE }))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::same(12))
-                    .show(ui, |ui| ui.vertical(|ui| {
-                        ui.set_width(180.0);
-                        ui.label(RichText::new(&c.name).strong());
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(value.map(|v| format!("{v:.0}%")).unwrap_or("—".into())).size(20.0));
-                            ui.label(RichText::new(format!("{} · {} fan{}", c.kind.label(), users, if users == 1 { "" } else { "s" })).size(11.5).color(MUTED));
-                        });
-                    }))
-                    .response
-                    .interact(Sense::click());
-                if resp.clicked() {
-                    self.selected_curve = Some(c.id.clone());
-                }
+        let mut clicked = None;
+        tiles(ui, 170.0, draft_curves.len(), |ui, i, w| {
+            let c = &draft_curves[i];
+            let selected = self.selected_curve.as_deref() == Some(c.id.as_str());
+            let value = eval.eval(&draft_curves, &c.id, &temps);
+            let users = self.draft.fans.iter().filter(|r| r.mode == FanMode::Curve && r.curve.as_deref() == Some(c.id.as_str())).count();
+            let resp = tile_frame(selected, false)
+                .show(ui, |ui| ui.vertical(|ui| {
+                    ui.set_width(w - TILE_CHROME);
+                    ui.add(egui::Label::new(RichText::new(&c.name).strong()).truncate());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(value.map(|v| format!("{v:.0}%")).unwrap_or("—".into())).size(20.0));
+                        ui.label(RichText::new(format!("{} · {} fan{}", c.kind.label(), users, if users == 1 { "" } else { "s" })).size(11.5).color(MUTED));
+                    });
+                }))
+                .response
+                .interact(Sense::click());
+            if resp.clicked() {
+                clicked = Some(c.id.clone());
             }
         });
+        if clicked.is_some() {
+            self.selected_curve = clicked;
+        }
         if let Some(cid) = self.selected_curve.clone() {
             ui.add_space(8.0);
             self.curve_editor_card(ui, &cid, &sensors, &temps);
@@ -260,7 +260,8 @@ impl App {
                 ui.checkbox(on, name.as_str());
             }
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 let chosen: Vec<String> = list.iter().filter(|x| x.2).map(|x| x.0.clone()).collect();
                 if ui.add_enabled(!chosen.is_empty(), egui::Button::new(RichText::new("Start auto-tune").strong()).fill(VIOLET)).clicked() {
                     start = Some(chosen);
@@ -291,7 +292,8 @@ impl App {
         card(ui, |ui| {
             ui.label(RichText::new("Motherboard fans and CPU temperature need the PawnIO driver").strong().color(GOLD));
             ui.label(RichText::new("PawnIO is the free, signed driver LibreHardwareMonitor uses to reach fan headers and CPU sensors. Until it's installed, only graphics card fans can be controlled.").size(12.5).color(MUTED));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 let busy = self.installing.lock().unwrap().clone();
                 match busy {
                     Some(what) => {
@@ -353,7 +355,8 @@ impl App {
         let mut remove = false;
         let r = &mut self.draft.fans[idx];
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(240.0).font(FontId::proportional(17.0)));
                 for (m, l) in [(FanMode::Firmware, "Firmware"), (FanMode::Curve, "Curve"), (FanMode::Manual, "Manual")] {
                     ui.selectable_value(&mut r.mode, m, l);
@@ -361,18 +364,19 @@ impl App {
                 if let Some(d) = decision {
                     chip(ui, &match d.percent { Some(p) => format!("{p:.0}% · {}", d.reason), None => d.reason.clone() }, if d.emergency { BAD } else { CYAN });
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                {
                     if ui.small_button("Stop managing").on_hover_text("Returns this header to firmware control after Save").clicked() {
                         remove = true;
                     }
-                });
+                }
             });
             match r.mode {
                 FanMode::Firmware => {
                     ui.label(RichText::new("The motherboard or graphics card controls this fan.").color(MUTED));
                 }
                 FanMode::Curve => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.label("Follows curve");
                         let current = r.curve.as_ref().and_then(|c| curves.iter().find(|x| &x.id == c)).map(|c| c.name.clone()).unwrap_or_else(|| "Choose…".into());
                         egui::ComboBox::from_id_salt("fan-curve").selected_text(current).width(200.0).show_ui(ui, |ui| {
@@ -393,66 +397,31 @@ impl App {
             }
         });
         ui.add_space(6.0);
-        ui.columns(2, |c| {
-            card(&mut c[0], |ui| {
-                sub(ui, "SPEED LIMITS & RESPONSE");
-                egui::Grid::new("limits").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                    ui.label("Minimum (stop)").on_hover_text("Lowest speed while running. Auto-tune measures this.");
-                    ui.add(egui::DragValue::new(&mut r.minimum_percent).range(0.0..=100.0).suffix("%"));
-                    ui.end_row();
-                    ui.label("Start").on_hover_text("Speed used to spin the fan up from standstill.");
-                    ui.add(egui::DragValue::new(&mut r.start_percent).range(0.0..=100.0).suffix("%"));
-                    ui.end_row();
-                    ui.label("Allow fan to stop");
-                    ui.checkbox(&mut r.allow_stop, "below minimum");
-                    ui.end_row();
-                    ui.label("Offset");
-                    ui.add(egui::DragValue::new(&mut r.offset_percent).range(-50.0..=50.0).suffix("%"));
-                    ui.end_row();
-                    ui.label("Step up");
-                    ui.add(egui::DragValue::new(&mut r.step_up_per_sec).range(1.0..=100.0).suffix("%/s"));
-                    ui.end_row();
-                    ui.label("Step down");
-                    ui.add(egui::DragValue::new(&mut r.ramp_down_per_sec).range(0.5..=100.0).speed(0.2).suffix("%/s"));
-                    ui.end_row();
-                    ui.label("Hysteresis");
-                    ui.add(egui::DragValue::new(&mut r.hysteresis).range(0.0..=10.0).speed(0.1).suffix("°C"));
-                    ui.end_row();
-                });
+        let wide = ui.available_width() >= 720.0;
+        let mut pair = |ui: &mut egui::Ui, first: bool| {
+            if first {
+                limits_card(ui, r);
+            } else {
+                safety_card(ui, r, sensors);
+            }
+        };
+        if wide {
+            ui.columns(2, |c| {
+                pair(&mut c[0], true);
+                pair(&mut c[1], false);
             });
-            card(&mut c[1], |ui| {
-                sub(ui, "SAFETY");
-                egui::Grid::new("safety").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                    ui.label("Critical temperature");
-                    ui.add(egui::DragValue::new(&mut r.critical_temp).range(50.0..=100.0).suffix("°C"));
-                    ui.end_row();
-                    ui.label("RPM sensor");
-                    let current = r.rpm_sensor_id.as_ref().and_then(|id| sensors.iter().find(|x| &x.id == id)).map(|x| x.name.clone()).unwrap_or_else(|| "None".into());
-                    egui::ComboBox::from_id_salt("rpm").selected_text(current).width(160.0).truncate().show_ui(ui, |ui| {
-                        ui.selectable_value(&mut r.rpm_sensor_id, None, "None");
-                        for f in sensors.iter().filter(|x| x.kind == "Fan") {
-                            ui.selectable_value(&mut r.rpm_sensor_id, Some(f.id.clone()), format!("{} · {}  {}", short_hw(&f.hardware), f.name, fmt_sensor(f)));
-                        }
-                    });
-                    ui.end_row();
-                });
-                ui.collapsing(format!("Extra failsafe sensors ({})", r.sensors.len()), |ui| {
-                    for t in sensors.iter().filter(|x| x.kind == "Temperature") {
-                        let mut on = r.sensors.contains(&t.id);
-                        if ui.checkbox(&mut on, format!("{} · {}  {}", short_hw(&t.hardware), t.name, fmt_sensor(t))).changed() {
-                            if on { r.sensors.push(t.id.clone()) } else { r.sensors.retain(|x| x != &t.id) }
-                        }
-                    }
-                });
-                ui.label(RichText::new("Any watched sensor at the critical limit, missing or stale sensors, or a stalled fan (<100 RPM for 15 s) force 100% instantly.").size(11.5).color(MUTED));
-                let _ = temps;
-            });
-        });
+        } else {
+            pair(ui, true);
+            ui.add_space(6.0);
+            pair(ui, false);
+        }
+        let _ = temps;
         ui.add_space(6.0);
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 sub(ui, "CALIBRATION");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                {
                     if ui.add_enabled(!busy, egui::Button::new("Measure this fan")).on_hover_text("Sweeps only this header (≈1 minute) and stores its RPM table and limits.").clicked() {
                         let _ = self.tx.send(Cmd::TuneFan(id.to_string()));
                     }
@@ -463,7 +432,7 @@ impl App {
                         r.minimum_percent = t.minimum;
                         r.start_percent = t.start;
                     }
-                });
+                }
             });
             if r.calibration.is_empty() {
                 ui.label(RichText::new("Not measured yet.").color(MUTED));
@@ -502,7 +471,8 @@ impl App {
         let label = |id: &str| sensors.iter().find(|x| x.id == id).map(|x| format!("{} · {}", short_hw(&x.hardware), x.name)).unwrap_or_else(|| format!("missing: {id}"));
         let c = &mut self.draft.curves[idx];
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(220.0).font(FontId::proportional(17.0)));
                 chip(ui, c.kind.label(), CYAN);
                 if !matches!(c.kind, CurveKind::Flat { .. } | CurveKind::Mix { .. }) {
@@ -513,13 +483,13 @@ impl App {
                 if let Some(v) = live {
                     chip(ui, &format!("now {v:.0}%"), GOOD);
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                {
                     let in_use = !users.is_empty() || !mixers.is_empty();
                     let why = format!("Used by {}", users.iter().chain(mixers.iter()).cloned().collect::<Vec<_>>().join(", "));
                     if ui.add_enabled(!in_use, egui::Button::new("Delete curve")).on_disabled_hover_text(why).clicked() {
                         delete = true;
                     }
-                });
+                }
             });
             let sensor_combo = |ui: &mut egui::Ui, value: &mut String, salt: &str| {
                 egui::ComboBox::from_id_salt(salt).selected_text(label(value)).width(280.0).show_ui(ui, |ui| {
@@ -530,7 +500,8 @@ impl App {
             };
             match &mut c.kind {
                 CurveKind::Graph { sensors: srcs, mix, offset, points } => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.menu_button(format!("Sensors ({})", srcs.len()), |ui| {
                             for x in &temp_sensors {
                                 let mut on = srcs.contains(&x.id);
@@ -541,19 +512,20 @@ impl App {
                         });
                         ui.label(RichText::new(srcs.iter().map(|s| label(s)).collect::<Vec<_>>().join(", ")).size(12.0).color(MUTED));
                     });
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.label("Combine");
                         ui.selectable_value(mix, Mix::Max, "Hottest");
                         ui.selectable_value(mix, Mix::Average, "Average");
                         ui.label("Offset");
                         ui.add(egui::DragValue::new(offset).range(-20.0..=20.0).speed(0.2).suffix("°C"));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            for (p, l) in [(CurvePreset::Performance, "Performance"), (CurvePreset::Balanced, "Balanced"), (CurvePreset::Silent, "Silent")] {
+                        {
+                            for (p, l) in [(CurvePreset::Silent, "Silent"), (CurvePreset::Balanced, "Balanced"), (CurvePreset::Performance, "Performance")] {
                                 if ui.small_button(l).clicked() {
                                     *points = preset(p);
                                 }
                             }
-                        });
+                        }
                     });
                     let vals: Vec<f64> = srcs.iter().filter_map(|s| temps.get(s).copied()).collect();
                     let t = (!vals.is_empty()).then(|| match mix {
@@ -565,7 +537,8 @@ impl App {
                 }
                 CurveKind::Linear { sensor, low_temp, high_temp, low_percent, high_percent } => {
                     sensor_combo(ui, sensor, "lin-sensor");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.add(egui::DragValue::new(low_percent).range(0.0..=100.0).suffix("%"));
                         ui.label("at");
                         ui.add(egui::DragValue::new(low_temp).range(0.0..=109.0).suffix("°C"));
@@ -582,7 +555,8 @@ impl App {
                 }
                 CurveKind::Trigger { sensor, idle_temp, load_temp, idle_percent, load_percent } => {
                     sensor_combo(ui, sensor, "trig-sensor");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.label("Load");
                         ui.add(egui::DragValue::new(load_percent).range(0.0..=100.0).suffix("%"));
                         ui.label("from");
@@ -596,7 +570,8 @@ impl App {
                     *load_percent = load_percent.max(*idle_percent);
                 }
                 CurveKind::Mix { curves: refs, function } => {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         for (f, l) in [(MixFn::Max, "Highest"), (MixFn::Average, "Average"), (MixFn::Min, "Lowest"), (MixFn::Sum, "Sum")] {
                             ui.selectable_value(function, f, l);
                         }
@@ -617,6 +592,64 @@ impl App {
             ui.label(RichText::new(format!("{e:#}")).color(BAD));
         }
     }
+}
+
+fn limits_card(ui: &mut egui::Ui, r: &mut FanRule) {
+    card(ui, |ui| {
+        sub(ui, "SPEED LIMITS & RESPONSE");
+        egui::Grid::new("limits").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+            ui.label("Minimum (stop)").on_hover_text("Lowest speed while running. Auto-tune measures this.");
+            ui.add(egui::DragValue::new(&mut r.minimum_percent).range(0.0..=100.0).suffix("%"));
+            ui.end_row();
+            ui.label("Start").on_hover_text("Speed used to spin the fan up from standstill.");
+            ui.add(egui::DragValue::new(&mut r.start_percent).range(0.0..=100.0).suffix("%"));
+            ui.end_row();
+            ui.label("Allow fan to stop");
+            ui.checkbox(&mut r.allow_stop, "below minimum");
+            ui.end_row();
+            ui.label("Offset");
+            ui.add(egui::DragValue::new(&mut r.offset_percent).range(-50.0..=50.0).suffix("%"));
+            ui.end_row();
+            ui.label("Step up");
+            ui.add(egui::DragValue::new(&mut r.step_up_per_sec).range(1.0..=100.0).suffix("%/s"));
+            ui.end_row();
+            ui.label("Step down");
+            ui.add(egui::DragValue::new(&mut r.ramp_down_per_sec).range(0.5..=100.0).speed(0.2).suffix("%/s"));
+            ui.end_row();
+            ui.label("Hysteresis");
+            ui.add(egui::DragValue::new(&mut r.hysteresis).range(0.0..=10.0).speed(0.1).suffix("°C"));
+            ui.end_row();
+        });
+    });
+}
+
+fn safety_card(ui: &mut egui::Ui, r: &mut FanRule, sensors: &[Sensor]) {
+    card(ui, |ui| {
+        sub(ui, "SAFETY");
+        egui::Grid::new("safety").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+            ui.label("Critical temperature");
+            ui.add(egui::DragValue::new(&mut r.critical_temp).range(50.0..=100.0).suffix("°C"));
+            ui.end_row();
+            ui.label("RPM sensor");
+            let current = r.rpm_sensor_id.as_ref().and_then(|id| sensors.iter().find(|x| &x.id == id)).map(|x| x.name.clone()).unwrap_or_else(|| "None".into());
+            egui::ComboBox::from_id_salt("rpm").selected_text(current).width(160.0).truncate().show_ui(ui, |ui| {
+                ui.selectable_value(&mut r.rpm_sensor_id, None, "None");
+                for f in sensors.iter().filter(|x| x.kind == "Fan") {
+                    ui.selectable_value(&mut r.rpm_sensor_id, Some(f.id.clone()), format!("{} · {}  {}", short_hw(&f.hardware), f.name, fmt_sensor(f)));
+                }
+            });
+            ui.end_row();
+        });
+        ui.collapsing(format!("Extra failsafe sensors ({})", r.sensors.len()), |ui| {
+            for t in sensors.iter().filter(|x| x.kind == "Temperature") {
+                let mut on = r.sensors.contains(&t.id);
+                if ui.checkbox(&mut on, format!("{} · {}  {}", short_hw(&t.hardware), t.name, fmt_sensor(t))).changed() {
+                    if on { r.sensors.push(t.id.clone()) } else { r.sensors.retain(|x| x != &t.id) }
+                }
+            }
+        });
+        ui.add(egui::Label::new(RichText::new("Any watched sensor at the critical limit, missing or stale sensors, or a stalled fan (<100 RPM for 15 s) force 100% instantly.").size(11.5).color(MUTED)).wrap());
+    });
 }
 
 pub(super) fn curve_editor(ui: &mut egui::Ui, points: &mut Vec<CurvePoint>, live_temp: Option<f64>) {
@@ -705,7 +738,7 @@ fn calibration_chart(ui: &mut egui::Ui, cal: &[CalibrationPoint], minimum: f64) 
     pts.sort_by(|a, b| a.percent.total_cmp(&b.percent));
     let to = |pc: f64, rpm: f64| pos2(rect.left() + (pc / 100.0) as f32 * rect.width(), rect.bottom() - (rpm / max) as f32 * rect.height());
     let mx = to(minimum, 0.0).x;
-    p.rect_filled(Rect::from_min_max(rect.left_top(), pos2(mx, rect.bottom())), CornerRadius::same(4), GOLD.gamma_multiply(0.08));
+    p.rect_filled(Rect::from_min_max(rect.left_top(), pos2(mx, rect.bottom())), CornerRadius::same(4), Color32::from_rgba_unmultiplied(255, 204, 102, 22));
     p.line_segment([pos2(mx, rect.top()), pos2(mx, rect.bottom())], Stroke::new(1.0, GOLD.gamma_multiply(0.6)));
     p.text(pos2(mx + 3.0, rect.bottom()), Align2::LEFT_BOTTOM, format!("minimum {minimum:.0}%"), FontId::proportional(10.5), GOLD);
     p.add(egui::Shape::line(pts.iter().map(|c| to(c.percent, c.rpm)).collect(), Stroke::new(2.0, CYAN)));

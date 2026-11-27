@@ -63,8 +63,12 @@ pub fn run(state: State, tx: Sender<Cmd>, repaint: Arc<Mutex<Option<egui::Contex
     // works on small laptops and at high display scaling.
     let (sw, sh) = platform::work_area().unwrap_or((1920.0, 1040.0));
     let mut initial = [1180.0f32.min(sw * 0.9), 780.0f32.min(sh * 0.88)];
-    if std::env::var_os("STELLAR_SNAPSHOT_TALL").is_some() {
-        initial = [1180.0, 2000.0]; // developer screenshots only
+    // Developer screenshots only: STELLAR_SNAPSHOT_SIZE=900x700
+    if let Some((w, h)) = std::env::var("STELLAR_SNAPSHOT_SIZE").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    }) {
+        initial = [w, h];
     }
     let minimum = [760.0f32.min(sw * 0.8), 500.0f32.min(sh * 0.7)];
     let options = eframe::NativeOptions {
@@ -104,6 +108,8 @@ struct App {
     installing: Arc<Mutex<Option<String>>>,
     /// Developer aid: STELLAR_SNAPSHOT=dir saves a PNG of every page and exits.
     snapshot: Option<(std::path::PathBuf, usize, u32)>,
+    snapshot_scroll: Option<f32>,
+    snapshot_bottom: bool,
 }
 
 impl App {
@@ -173,6 +179,8 @@ impl App {
             brush: [255, 40, 40],
             installing: Arc::new(Mutex::new(None)),
             snapshot: std::env::var_os("STELLAR_SNAPSHOT").map(|d| (d.into(), 0, 0)),
+            snapshot_scroll: None,
+            snapshot_bottom: false,
         }
     }
 
@@ -291,13 +299,49 @@ fn style(ctx: &egui::Context) {
     });
 }
 
+/// Width taken by a tile's frame (margins + stroke) around its content.
+const TILE_CHROME: f32 = 28.0;
+
+fn tile_frame(selected: bool, alert: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if selected { VIOLET.gamma_multiply(0.22) } else { CARD })
+        .stroke(Stroke::new(1.0, if alert { BAD } else if selected { VIOLET } else { LINE }))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(12))
+}
+
+/// Lays out `n` equal-width tiles in rows that always fit the available
+/// width (at least `min_w` each), so card rows never overflow the window.
+fn tiles(ui: &mut egui::Ui, min_w: f32, n: usize, mut f: impl FnMut(&mut egui::Ui, usize, f32)) {
+    let gap = ui.spacing().item_spacing.x;
+    let avail = ui.available_width();
+    let per_row = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
+    let w = ((avail - gap * (per_row - 1) as f32) / per_row as f32).floor().max(min_w.min(avail));
+    let idx: Vec<usize> = (0..n).collect();
+    for row in idx.chunks(per_row) {
+        ui.horizontal(|ui| {
+            for &i in row {
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    f(ui, i, w);
+                });
+            }
+        });
+    }
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(CARD)
         .stroke(Stroke::new(1.0, LINE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(14))
-        .show(ui, add)
+        .show(ui, |ui| {
+            // Panels span the full width available, so stacked panels line up,
+            // and use a plain top-down layout so wrapped text isn't justified.
+            ui.set_min_width(ui.available_width());
+            ui.with_layout(Layout::top_down(Align::Min), add).inner
+        })
         .inner
 }
 
@@ -368,9 +412,14 @@ impl eframe::App for App {
         if let Some((dir, page, frames)) = &mut self.snapshot
             && self.started.elapsed().as_secs() >= 18
         {
+            // Each page is captured twice: top, then scrolled to the bottom.
             const PAGES: [Page; 6] = [Page::Overview, Page::Cooling, Page::Lighting, Page::Profiles, Page::Sensors, Page::Settings];
             *frames += 1;
-            self.page = PAGES[(*page).min(5)];
+            self.page = PAGES[(*page / 2).min(5)];
+            self.snapshot_bottom = *page % 2 == 1;
+            if !self.snapshot_bottom {
+                self.snapshot_scroll = Some(0.0);
+            }
 
             if *frames == 40 {
                 let path = dir.join(format!("page{page}.png"));
@@ -381,7 +430,7 @@ impl eframe::App for App {
             } else if *frames == 50 {
                 *frames = 0;
                 *page += 1;
-                if *page >= PAGES.len() {
+                if *page >= PAGES.len() * 2 {
                     let _ = std::fs::write(dir.join("done"), b"");
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -393,7 +442,8 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(if animated { 50 } else { 500 }));
 
         egui::Panel::left("nav").exact_size(210.0).resizable(false).frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(16))).show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.add(egui::Image::new(&self.logo).fit_to_exact_size(vec2(34.0, 34.0)));
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Stellar").size(22.0).strong());
@@ -441,9 +491,10 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(22))).show(ui, |ui| {
             if self.cooling_dirty() {
                 egui::Frame::new().fill(VIOLET.gamma_multiply(0.2)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                         ui.label(RichText::new("Unsaved cooling or automation changes").strong());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        {
                             let valid = self.draft.validate();
                             if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new("Save").strong()).fill(VIOLET)).clicked() {
                                 let mut new = self.draft.clone();
@@ -458,12 +509,16 @@ impl eframe::App for App {
                             if let Err(e) = valid {
                                 ui.label(RichText::new(format!("{e:#}")).color(BAD));
                             }
-                        });
+                        }
                     });
                 });
                 ui.add_space(8.0);
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.page {
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if let Some(y) = self.snapshot_scroll {
+                area = area.vertical_scroll_offset(y);
+            }
+            let out = area.show(ui, |ui| match self.page {
                 Page::Overview => self.overview(ui),
                 Page::Cooling => self.cooling(ui),
                 Page::Lighting => self.lighting(ui),
@@ -471,6 +526,9 @@ impl eframe::App for App {
                 Page::Sensors => self.sensors(ui),
                 Page::Settings => self.settings_page(ui),
             });
+            if self.snapshot.is_some() && self.snapshot_bottom {
+                self.snapshot_scroll = Some((out.content_size.y - out.inner_rect.height()).max(0.0));
+            }
         });
 
         if self.confirm_quit {
@@ -479,7 +537,8 @@ impl eframe::App for App {
                 if self.cooling_dirty() {
                     ui.label(RichText::new("Unsaved cooling changes will be lost.").color(GOLD));
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                     if ui.add(egui::Button::new("Quit").fill(BAD.gamma_multiply(0.7))).clicked() {
                         self.quitting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -509,31 +568,35 @@ impl App {
         let gpu = s.history.back().and_then(|h| h.1);
         let cpu_load = s.snapshot.sensors.iter().find(|x| x.kind == "Load" && x.id.contains("cpu") && x.name == "CPU Total").and_then(|x| x.value);
         let gpu_load = s.snapshot.sensors.iter().find(|x| x.kind == "Load" && x.id.starts_with("/gpu-nvidia") && x.name == "GPU Core").and_then(|x| x.value);
-        ui.columns(4, |c| {
-            stat(&mut c[0], "CPU", cpu, cpu_load);
-            stat(&mut c[1], "GPU", gpu, gpu_load);
-            card(&mut c[2], |ui| {
+        tiles(ui, 175.0, 4, |ui, i, _| match i {
+            0 => stat(ui, "CPU", cpu, cpu_load),
+            1 => stat(ui, "GPU", gpu, gpu_load),
+            2 => card(ui, |ui| {
                 sub(ui, "COOLING");
                 ui.label(RichText::new(&s.cooling_status).size(16.0).color(if s.emergency { BAD } else if s.cooling_ok { TEXT } else { GOLD }));
                 if let Some(c) = s.competing {
                     ui.label(RichText::new(format!("{c} is running")).color(GOLD).size(12.0));
                 }
-            });
-            card(&mut c[3], |ui| {
+            }),
+            _ => card(ui, |ui| {
                 sub(ui, "LIGHTING");
                 let l = &s.settings.lighting;
-                ui.label(RichText::new(if l.on { l.effect.label() } else { "Off" }).size(16.0));
-                ui.label(RichText::new(&s.lighting_status).color(MUTED).size(12.0));
-            });
+                let text = if !l.managed { "Not controlled" } else if l.on { l.effect.label() } else { "Off" };
+                ui.label(RichText::new(text).size(16.0));
+                if l.managed {
+                    ui.label(RichText::new(&s.lighting_status).color(MUTED).size(12.0));
+                }
+            }),
         });
         ui.add_space(8.0);
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 sub(ui, "TEMPERATURES · LAST 10 MINUTES");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                {
                     dot_label(ui, CYAN, "GPU");
                     dot_label(ui, VIOLET, "CPU");
-                });
+                }
             });
             history_chart(ui, &s.history);
         });
@@ -544,30 +607,41 @@ impl App {
             if outputs.is_empty() {
                 ui.label(RichText::new("No controllable fan outputs detected yet. Stellar needs administrator rights to reach motherboard fan headers.").color(MUTED));
             }
-            egui::Grid::new("fans").num_columns(5).spacing([24.0, 10.0]).striped(false).show(ui, |ui| {
-                for o in outputs {
+            let shown: Vec<&Sensor> = outputs
+                .into_iter()
+                .filter(|o| {
                     let rule = s.settings.rule(&o.id);
                     let rpm_id = rule.and_then(|r| r.rpm_sensor_id.clone()).unwrap_or_else(|| paired_rpm(&o.id));
-                    let rpm = s.sensor(&rpm_id).and_then(|x| x.value);
-                    if rule.is_none() && rpm.unwrap_or(0.0) < 1.0 {
-                        continue; // unused headers live in the sensor library
-                    }
+                    // Unused headers live in the sensor library.
+                    rule.is_some() || s.sensor(&rpm_id).and_then(|x| x.value).unwrap_or(0.0) >= 1.0
+                })
+                .collect();
+            tiles(ui, 230.0, shown.len(), |ui, i, w| {
+                let o = shown[i];
+                let rule = s.settings.rule(&o.id);
+                let rpm_id = rule.and_then(|r| r.rpm_sensor_id.clone()).unwrap_or_else(|| paired_rpm(&o.id));
+                let rpm = s.sensor(&rpm_id).and_then(|x| x.value);
+                let d = s.decisions.get(&o.id);
+                let emergency = d.is_some_and(|d| d.emergency);
+                tile_frame(false, emergency).show(ui, |ui| {
+                    ui.set_width(w - TILE_CHROME);
                     let name = rule.map(|r| r.name.clone()).unwrap_or_else(|| format!("{} · {}", short_hw(&o.hardware), o.name));
-                    ui.label(RichText::new(name).strong());
+                    ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
                     let duty = o.value.unwrap_or(0.0);
-                    ui.add(egui::ProgressBar::new((duty / 100.0) as f32).desired_width(160.0).text(format!("{duty:.0}%")).fill(VIOLET));
+                    ui.add(egui::ProgressBar::new((duty / 100.0) as f32).desired_width(w - TILE_CHROME).text(format!("{duty:.0}%")).fill(VIOLET));
                     let expected = rule.and_then(|r| r.expected_rpm(duty));
                     ui.label(match (rpm, expected) {
-                        (Some(r), Some(x)) => format!("{r:.0} RPM  (calibrated ≈{x:.0})"),
+                        (Some(r), Some(x)) => format!("{r:.0} RPM  ·  calibrated ≈{x:.0}"),
                         (Some(r), None) => format!("{r:.0} RPM"),
                         _ => "—".into(),
                     });
                     let mode = rule.map(|r| r.mode).unwrap_or_default();
-                    chip(ui, match mode { FanMode::Firmware => "Firmware", FanMode::Curve => "Curve", FanMode::Manual => "Manual" }, if mode == FanMode::Firmware { MUTED } else { CYAN });
-                    let d = s.decisions.get(&o.id);
-                    ui.label(RichText::new(d.map(|d| d.reason.as_str()).unwrap_or("Firmware control")).color(if d.is_some_and(|d| d.emergency) { BAD } else { MUTED }));
-                    ui.end_row();
-                }
+                    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
+                        chip(ui, match mode { FanMode::Firmware => "Firmware", FanMode::Curve => "Curve", FanMode::Manual => "Manual" }, if mode == FanMode::Firmware { MUTED } else { CYAN });
+                        ui.label(RichText::new(d.map(|d| d.reason.as_str()).unwrap_or("Firmware control")).size(12.0).color(if emergency { BAD } else { MUTED }));
+                    });
+                });
             });
         });
         ui.add_space(8.0);
@@ -616,18 +690,19 @@ impl App {
             });
             return;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             chip(ui, &status.1, if status.0 { GOOD } else { GOLD });
             if ui.small_button("Reconnect").clicked() {
                 self.send(Cmd::ReconnectLighting);
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            {
                 if ui.small_button("Stop controlling lighting").on_hover_text("Stellar lets go of all RGB devices; other apps can take over.").clicked() {
                     let mut new = self.committed.clone();
                     new.lighting.managed = false;
                     self.send(Cmd::Save(new));
                 }
-            });
+            }
         });
         if !openrgb {
             card(ui, |ui| {
@@ -651,7 +726,8 @@ impl App {
         ui.add_space(6.0);
         let l = &mut self.draft.lighting;
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 let label = if l.on { "Lights on" } else { "Lights off" };
                 if ui.add(egui::Button::new(RichText::new(label).size(16.0).strong()).fill(if l.on { VIOLET } else { Color32::from_rgb(40, 44, 70) }).min_size(vec2(140.0, 38.0))).clicked() {
                     l.on = !l.on;
@@ -686,7 +762,8 @@ impl App {
                 l.quiet_hours = on.then_some(QuietHours { start_min: 23 * 60, end_min: 7 * 60 });
             }
             if let Some(q) = &mut l.quiet_hours {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                     ui.label("From");
                     time_edit(ui, &mut q.start_min, "qs");
                     ui.label("until");
@@ -723,10 +800,11 @@ impl App {
                 ui.label(RichText::new(format!("Selected by automation: {a}")).color(CYAN));
             }
             for p in &profiles {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                     let active = self.committed.active_profile.as_deref() == Some(p);
                     ui.label(RichText::new(p).strong().color(if active { VIOLET } else { TEXT }));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    {
                         if ui.small_button("Delete").clicked() {
                             let _ = self.tx.send(Cmd::DeleteProfile(p.clone()));
                         }
@@ -736,11 +814,12 @@ impl App {
                         if ui.add(egui::Button::new("Apply").fill(VIOLET.gamma_multiply(0.6))).clicked() {
                             let _ = self.tx.send(Cmd::ApplyProfile(p.clone()));
                         }
-                    });
+                    }
                 });
             }
             ui.separator();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.add(egui::TextEdit::singleline(&mut self.profile_name).hint_text("New profile name").desired_width(220.0));
                 let valid = crate::config::validate_profile_name(&self.profile_name);
                 if ui.add_enabled(valid.is_ok() && !self.cooling_dirty(), egui::Button::new("Save current as profile")).on_disabled_hover_text(if self.cooling_dirty() { "Save or discard cooling changes first".to_string() } else { valid.err().map(|e| e.to_string()).unwrap_or_default() }).clicked() {
@@ -766,10 +845,14 @@ impl App {
             if let Some(i) = remove {
                 self.draft.automation.remove(i);
             }
-            if ui.add_enabled(!profiles.is_empty(), egui::Button::new("Add rule")).clicked() {
+            if profiles.is_empty() {
+                ui.label(RichText::new("Save a profile above first — automation switches between your profiles.").size(12.5).color(GOLD));
+            }
+            if ui.add_enabled(!profiles.is_empty(), egui::Button::new("Add rule")).on_disabled_hover_text("Save a profile first — automation switches between profiles").clicked() {
                 self.draft.automation.push(AutoRule { process: String::new(), profile: profiles[0].clone() });
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.label("When no rule matches, switch to");
                 let mut fb = self.draft.fallback_profile.clone().unwrap_or_default();
                 egui::ComboBox::from_id_salt("fallback").selected_text(if fb.is_empty() { "(stay as is)" } else { fb.as_str() }).show_ui(ui, |ui| {
@@ -820,14 +903,15 @@ impl App {
             sub(ui, "SYSTEM");
             egui::Grid::new("sys").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
                 ui.label("Hardware host");
-                ui.add(egui::Label::new(crate::hardware::host_path().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".into())).truncate());
+                let host = crate::hardware::host_path().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".into());
+                ui.add(egui::Label::new(host.clone()).truncate()).on_hover_text(host);
                 ui.end_row();
                 ui.label("Competing fan software");
                 ui.label(s.competing.unwrap_or("none"));
                 ui.end_row();
                 ui.label("Data folder");
                 let dir = crate::config::Store::default_location().dir;
-                if ui.link(dir.display().to_string()).clicked() {
+                if ui.add(egui::Label::new(RichText::new(dir.display().to_string()).color(CYAN)).truncate().sense(Sense::click())).on_hover_text("Open in File Explorer").clicked() {
                     let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                 }
                 ui.end_row();
@@ -883,7 +967,8 @@ fn demo_keyboard() -> crate::lighting::DeviceInfo {
 }
 
 fn dot_label(ui: &mut egui::Ui, color: Color32, text: &str) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
         ui.spacing_mut().item_spacing.x = 6.0;
         let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 4.0, color);
@@ -898,7 +983,8 @@ fn short_hw(h: &str) -> String {
 fn stat(ui: &mut egui::Ui, label: &str, temp: Option<f64>, load: Option<f64>) {
     card(ui, |ui| {
         sub(ui, label);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             match temp {
                 Some(t) => ui.label(RichText::new(format!("{t:.0}°")).size(34.0).strong().color(temp_color(t))),
                 None => ui.label(RichText::new("—").size(34.0).color(MUTED)),
@@ -953,7 +1039,8 @@ fn preview_strip(ui: &mut egui::Ui, l: &crate::config::LightingSettings, device:
 }
 
 fn color_row(ui: &mut egui::Ui, c: &mut Rgb) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
         ui.color_edit_button_srgb(c);
         for (sw, name) in SWATCHES {
             let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
@@ -972,6 +1059,7 @@ fn color_row(ui: &mut egui::Ui, c: &mut Rgb) {
 fn effect_editor(ui: &mut egui::Ui, e: &mut Effect, sensors: &[Sensor], salt: &str) {
     let current = e.label();
     ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
         let color = match e {
             Effect::Static { color } | Effect::Breathing { color, .. } => *color,
             _ => [255, 255, 255],
@@ -1006,7 +1094,8 @@ fn effect_editor(ui: &mut egui::Ui, e: &mut Effect, sensors: &[Sensor], salt: &s
             ui.add(egui::Slider::new(spread, 0.1..=4.0).text("rainbows across strip"));
         }
         Effect::Gradient { from, to } => {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.label("From");
                 ui.color_edit_button_srgb(from);
                 ui.label("to");
@@ -1020,7 +1109,8 @@ fn effect_editor(ui: &mut egui::Ui, e: &mut Effect, sensors: &[Sensor], salt: &s
                     ui.selectable_value(sensor, x.id.clone(), format!("{} · {}  {}", short_hw(&x.hardware), x.name, fmt_sensor(x)));
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 ui.color_edit_button_srgb(cool);
                 ui.label("at");
                 ui.add(egui::DragValue::new(low).range(0.0..=105.0).suffix("°C"));

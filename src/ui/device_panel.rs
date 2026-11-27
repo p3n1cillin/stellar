@@ -29,18 +29,37 @@ pub(super) fn device_card(
     let global = l.effect.clone();
     let preview_settings = LightingSettings { on: true, ..l.clone() };
     let preview = crate::lighting::frame(&preview_settings, &d.name, d.leds, t, temps, false);
+    let zone_sizes = &mut l.zone_sizes;
     let entry = l.devices.entry(d.name.clone()).or_default();
     card(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             ui.checkbox(&mut entry.enabled, RichText::new(&d.name).strong().size(15.0));
             chip(ui, kind_label(d.kind), CYAN);
             ui.label(RichText::new(format!("{} · {} LED{}", d.vendor, d.leds, if d.leds == 1 { "" } else { "s" })).color(MUTED));
         });
+        // LED counts for addressable headers (where the length can't be detected).
+        let resizable: Vec<_> = d.zones.iter().filter(|z| z.3 > z.2).collect();
+        if !resizable.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
+                ui.label(RichText::new("LED counts").size(12.0).color(MUTED));
+                for (zone, count, min, max) in resizable {
+                    let sizes = zone_sizes.entry(d.name.clone()).or_default();
+                    let mut v = sizes.get(zone).copied().unwrap_or(*count);
+                    ui.label(RichText::new(zone).size(12.0));
+                    if ui.add(egui::DragValue::new(&mut v).range(*min..=*max).suffix(" LEDs")).changed() {
+                        sizes.insert(zone.clone(), v);
+                    }
+                }
+            });
+        }
         if !entry.enabled {
             ui.label(RichText::new("Off — Stellar keeps this device dark.").size(12.0).color(MUTED));
             return;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             ui.label("Lighting from");
             let mut onboard = entry.onboard.is_some();
             ui.selectable_value(&mut onboard, false, "Stellar (synced with everything)");
@@ -56,7 +75,8 @@ pub(super) fn device_card(
             onboard_editor(ui, d, ob, actions);
             return;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             let mut own = entry.effect.is_some();
             if ui.checkbox(&mut own, "Own effect for this device").changed() {
                 entry.effect = own.then(|| global.clone());
@@ -79,21 +99,6 @@ pub(super) fn device_card(
                 .show(ui, |ui| led_painter(ui, d, entry, &preview, brush));
         }
     });
-    // Zone sizes for addressable headers (where the LED count can't be detected).
-    let resizable: Vec<_> = d.zones.iter().filter(|z| z.3 > z.2).collect();
-    if !resizable.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("LED counts").size(12.0).color(MUTED));
-            for (zone, count, min, max) in resizable {
-                let sizes = l.zone_sizes.entry(d.name.clone()).or_default();
-                let mut v = sizes.get(zone).copied().unwrap_or(*count);
-                ui.label(RichText::new(zone).size(12.0));
-                if ui.add(egui::DragValue::new(&mut v).range(*min..=*max).suffix(" LEDs")).changed() {
-                    sizes.insert(zone.clone(), v);
-                }
-            }
-        });
-    }
     if l.devices.get(&d.name) == Some(&DeviceLighting::default()) {
         l.devices.remove(&d.name);
     }
@@ -102,6 +107,7 @@ pub(super) fn device_card(
 fn onboard_editor(ui: &mut egui::Ui, d: &DeviceInfo, ob: &mut OnboardMode, actions: &mut Vec<DeviceAction>) {
     ui.label(RichText::new("The device runs this effect itself — smooth, no CPU use, and it can be saved onto the device.").size(12.0).color(MUTED));
     ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
         for m in &d.modes {
             if ui.selectable_label(ob.mode == m.name, &m.name).clicked() && ob.mode != m.name {
                 *ob = OnboardMode { mode: m.name.clone(), ..Default::default() };
@@ -134,7 +140,8 @@ fn onboard_editor(ui: &mut egui::Ui, d: &DeviceInfo, ob: &mut OnboardMode, actio
         .collect();
         if !dirs.is_empty() {
             ui.label("Direction");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 let cur = ob.direction.unwrap_or(m.direction);
                 for (v, label) in dirs {
                     if ui.selectable_label(cur == v, label).clicked() {
@@ -146,7 +153,8 @@ fn onboard_editor(ui: &mut egui::Ui, d: &DeviceInfo, ob: &mut OnboardMode, actio
         }
         if m.flags & FLAG_HAS_MODE_SPECIFIC_COLOR != 0 {
             ui.label("Colours");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
                 if m.flags & FLAG_HAS_RANDOM_COLOR != 0 {
                     ui.checkbox(&mut ob.random, "Random");
                 }
@@ -173,7 +181,8 @@ fn onboard_editor(ui: &mut egui::Ui, d: &DeviceInfo, ob: &mut OnboardMode, actio
         }
     });
     if m.flags & FLAG_MANUAL_SAVE != 0 {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
             if ui.add(egui::Button::new("Save to device")).on_hover_text("Stores this effect in the device's own memory, so it keeps it with Stellar closed or on another PC").clicked() {
                 actions.push(DeviceAction::SaveToDevice(d.name.clone()));
             }
@@ -218,7 +227,8 @@ fn short_label(name: &str) -> String {
 /// Paint individual LEDs: a grid for devices with a physical layout,
 /// otherwise each zone as a row of LEDs. Left drag paints, right drag erases.
 fn led_painter(ui: &mut egui::Ui, d: &DeviceInfo, entry: &mut DeviceLighting, preview: &[Rgb], brush: &mut Rgb) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend); // move whole widgets to the next line instead of squashing them
         ui.label("Brush");
         ui.color_edit_button_srgb(brush);
         if ui.small_button("Fill all").clicked() {
