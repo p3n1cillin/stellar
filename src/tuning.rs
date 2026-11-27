@@ -157,10 +157,32 @@ impl AutoTune {
 }
 
 /// Every controllable output that has a matching RPM sensor.
-pub fn targets(sensors: &[Sensor], settings: &Settings, only: Option<&str>) -> Vec<Target> {
+/// A header that drives a pump must never be swept: stopping a pump, even
+/// briefly, is not a fan test. Recognised from the hardware's own label or the
+/// name the user gave it.
+pub fn looks_like_pump(names: &[&str]) -> bool {
+    names.iter().any(|n| {
+        let n = n.to_lowercase();
+        n.contains("pump") || n.contains("aio") || n.contains("w_pump") || n.contains("water")
+    })
+}
+
+/// A header the hardware itself labels as the CPU fan.
+fn looks_like_cpu_fan(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("cpu") && !n.contains("opt")
+}
+
+/// Controllable outputs that have a matching RPM sensor. `only` limits the
+/// list to chosen headers; without it, anything that looks like a pump is left out.
+pub fn targets(sensors: &[Sensor], settings: &Settings, only: Option<&[String]>) -> Vec<Target> {
     sensors
         .iter()
-        .filter(|s| s.kind == "Control" && s.can_control && only.is_none_or(|o| o == s.id))
+        .filter(|s| s.kind == "Control" && s.can_control)
+        .filter(|s| match only {
+            Some(list) => list.contains(&s.id),
+            None => !looks_like_pump(&[&s.name, settings.rule(&s.id).map(|r| r.name.as_str()).unwrap_or("")]),
+        })
         .filter_map(|s| {
             let rule = settings.rule(&s.id);
             let rpm = rule.and_then(|r| r.rpm_sensor_id.clone()).unwrap_or_else(|| paired_rpm(&s.id));
@@ -244,7 +266,10 @@ pub fn build(settings: &Settings, measured: &[Measured], sensors: &[Sensor], app
             (a, b) => a.clone().or(b.clone()),
         };
     }
-    let first_board = measured.iter().find(|m| m.control.starts_with("/lpc/")).map(|m| m.control.clone());
+    // Only a header the hardware labels "CPU" follows the CPU curve; every
+    // other header follows Case (the hotter of CPU and GPU), which is right
+    // for case fans, hubs and radiators alike when the wiring is unknown.
+    let hw_name = |id: &str| sensors.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
     for m in measured {
         let Some(t) = tune(&m.calibration, m.start) else {
             notes.push(format!("{}: no fan detected — left on firmware control", m.name));
@@ -266,7 +291,7 @@ pub fn build(settings: &Settings, measured: &[Measured], sensors: &[Sensor], app
         r.allow_stop = false;
         notes.push(format!("{}: {}", r.name, t.summary));
         if apply_curves && m.control.starts_with("/lpc/") {
-            let curve = if Some(&m.control) == first_board.as_ref() { cpu_curve.clone() } else { case_curve.clone() };
+            let curve = if looks_like_cpu_fan(&hw_name(&m.control)) { cpu_curve.clone() } else { case_curve.clone() };
             if let Some(c) = curve {
                 r.mode = FanMode::Curve;
                 r.curve = Some(c);
@@ -332,10 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn pumps_are_never_targeted() {
+        let sensors = vec![
+            sensor("/lpc/n/0/control/0", "Control", "CPU Fan", 50.0),
+            sensor("/lpc/n/0/fan/0", "Fan", "CPU Fan", 900.0),
+            sensor("/lpc/n/0/control/5", "Control", "AIO Pump", 100.0),
+            sensor("/lpc/n/0/fan/5", "Fan", "AIO Pump", 2800.0),
+            sensor("/lpc/n/0/control/6", "Control", "Fan #7", 100.0),
+            sensor("/lpc/n/0/fan/6", "Fan", "Fan #7", 2500.0),
+        ];
+        let mut settings = Settings::default();
+        settings.fans.push(FanRule { control_id: "/lpc/n/0/control/6".into(), name: "Pump header".into(), ..Default::default() });
+        let t: Vec<String> = targets(&sensors, &settings, None).into_iter().map(|t| t.control).collect();
+        assert_eq!(t, vec!["/lpc/n/0/control/0"], "pump by hardware label and by user name are skipped");
+        let chosen = vec!["/lpc/n/0/control/6".to_string()];
+        assert_eq!(targets(&sensors, &settings, Some(&chosen)).len(), 1, "an explicit choice is honoured");
+    }
+
+    #[test]
     fn build_assigns_cpu_and_case_curves() {
         let sensors = vec![
             sensor("/amdcpu/0/temperature/2", "Temperature", "Core (Tctl/Tdie)", 50.0),
             sensor("/gpu-nvidia/0/temperature/0", "Temperature", "GPU Core", 45.0),
+            sensor("/lpc/n/0/control/0", "Control", "CPU Fan", 50.0),
+            sensor("/lpc/n/0/control/1", "Control", "Fan #2", 50.0),
         ];
         let cal = |k: f64| (0..=10).map(|i| CalibrationPoint { percent: i as f64 * 10.0, rpm: if i >= 2 { i as f64 * k } else { 0.0 } }).collect::<Vec<_>>();
         let m = |c: &str, n: &str| Measured { control: c.into(), name: n.into(), rpm: c.replace("control", "fan"), calibration: cal(150.0), start: Some(20.0) };

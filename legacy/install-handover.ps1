@@ -15,7 +15,7 @@
   restore-legacy.ps1 undoes the handover.
 #>
 param(
-    [string]$Source = (Join-Path $PSScriptRoot 'dist'),
+    [string]$Source = (Join-Path $PSScriptRoot '..\dist\Stellar'),
     [switch]$NoStart
 )
 $ErrorActionPreference = 'Stop'

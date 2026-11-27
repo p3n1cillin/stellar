@@ -206,6 +206,10 @@ impl FanRule {
 
 pub type Rgb = [u8; 3];
 
+fn yes() -> bool {
+    true
+}
+
 /// A lighting effect. Every effect is rendered by Stellar itself and streamed
 /// to OpenRGB, so it looks identical across ASUS, Corsair and other devices.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -297,6 +301,11 @@ impl QuietHours {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct LightingSettings {
+    /// Whether Stellar controls RGB at all. Off for new installs so Stellar
+    /// never takes over someone's lighting uninvited; settings files from
+    /// before this option existed keep control on.
+    #[serde(default = "yes")]
+    pub managed: bool,
     pub on: bool,
     pub brightness: f64,
     pub effect: Effect,
@@ -308,6 +317,7 @@ pub struct LightingSettings {
 impl Default for LightingSettings {
     fn default() -> Self {
         Self {
+            managed: false,
             on: true,
             brightness: 100.0,
             effect: Effect::default(),
@@ -704,6 +714,7 @@ fn convert_v1(v: V1Settings) -> Result<Settings> {
         curves,
         fans,
         lighting: LightingSettings {
+            managed: true,
             on: v.lighting_on,
             effect: Effect::Static { color: [color[0], color[1], color[2]] },
             zone_sizes: v.zone_sizes,

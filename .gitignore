@@ -1,12 +1,13 @@
+# Stellar build outputs
+/target/
+/dist/
+hwhost/bin/
+hwhost/obj/
+
+# Legacy apps
 .venv/
 __pycache__/
 *.pyc
 config.json
-native/bin/
-native/obj/
-
-# Stellar
-stellar/target/
-stellar/dist/
-stellar/hwhost/bin/
-stellar/hwhost/obj/
+legacy/native/bin/
+legacy/native/obj/

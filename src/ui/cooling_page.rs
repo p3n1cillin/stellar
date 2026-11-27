@@ -28,7 +28,18 @@ impl App {
                         .on_disabled_hover_text("Save or discard changes first")
                         .clicked()
                     {
-                        self.send(Cmd::AutoTune);
+                        let sensors_now = self.state.lock().unwrap().snapshot.sensors.clone();
+                        let all: Vec<String> = sensors_now.iter().filter(|s| s.kind == "Control" && s.can_control).map(|s| s.id.clone()).collect();
+                        let default: Vec<String> = crate::tuning::targets(&sensors_now, &self.committed, None).into_iter().map(|t| t.control).collect();
+                        self.tune_dialog = Some(
+                            crate::tuning::targets(&sensors_now, &self.committed, Some(&all))
+                                .into_iter()
+                                .map(|t| {
+                                    let on = default.contains(&t.control);
+                                    (t.control, t.name, on)
+                                })
+                                .collect(),
+                        );
                     }
                     if measured
                         && ui
@@ -61,6 +72,11 @@ impl App {
         if let Some(c) = competing {
             ui.label(RichText::new(format!("{c} is running, so Stellar leaves every fan on firmware control. Quit it to let Stellar drive fans.")).color(GOLD));
         }
+        if let Some(g) = self.state.lock().unwrap().gpu_competing {
+            ui.label(RichText::new(format!("{g} is running, so the graphics card's fans are left to it.")).color(MUTED));
+        }
+        self.pawnio_banner(ui);
+        self.tune_dialog_window(ui.ctx());
         if let Some(t) = &tuning {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -227,6 +243,92 @@ impl App {
             ui.add_space(8.0);
             self.curve_editor_card(ui, &cid, &sensors, &temps);
         }
+    }
+
+    fn tune_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(list) = &mut self.tune_dialog else { return };
+        let mut start = None;
+        let mut close = false;
+        egui::Window::new("Auto-tune").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label("Each ticked header is swept from 100% down to 0% and back up, so its fans speed up, slow down and briefly stop. About a minute per connected header.");
+            ui.label(RichText::new("Untick any header that powers a pump (AIO or custom loop). Headers that look like pumps are unticked for you.").color(GOLD));
+            ui.add_space(6.0);
+            if list.is_empty() {
+                ui.label(RichText::new("No fan headers with RPM sensors were found.").color(MUTED));
+            }
+            for (_, name, on) in list.iter_mut() {
+                ui.checkbox(on, name.as_str());
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let chosen: Vec<String> = list.iter().filter(|x| x.2).map(|x| x.0.clone()).collect();
+                if ui.add_enabled(!chosen.is_empty(), egui::Button::new(RichText::new("Start auto-tune").strong()).fill(VIOLET)).clicked() {
+                    start = Some(chosen);
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if let Some(c) = start {
+            self.send(Cmd::AutoTune(Some(c)));
+            close = true;
+        }
+        if close {
+            self.tune_dialog = None;
+        }
+    }
+
+    /// Offer to install PawnIO when motherboard sensors are missing.
+    pub(super) fn pawnio_banner(&mut self, ui: &mut egui::Ui) {
+        let (pawnio, board) = {
+            let s = self.state.lock().unwrap();
+            (s.pawnio, s.snapshot.sensors.iter().any(|x| x.id.starts_with("/lpc/")))
+        };
+        if pawnio || board {
+            return;
+        }
+        card(ui, |ui| {
+            ui.label(RichText::new("Motherboard fans and CPU temperature need the PawnIO driver").strong().color(GOLD));
+            ui.label(RichText::new("PawnIO is the free, signed driver LibreHardwareMonitor uses to reach fan headers and CPU sensors. Until it's installed, only graphics card fans can be controlled.").size(12.5).color(MUTED));
+            ui.horizontal(|ui| {
+                let busy = self.installing.lock().unwrap().clone();
+                match busy {
+                    Some(what) => {
+                        ui.spinner();
+                        ui.label(format!("Installing {what}…"));
+                    }
+                    None => {
+                        if ui.add(egui::Button::new("Install PawnIO").fill(VIOLET)).clicked() {
+                            self.install_tool("PawnIO", "namazso.PawnIO", true);
+                        }
+                        ui.hyperlink_to("pawnio.eu", "https://pawnio.eu");
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    /// Install a winget package in the background; optionally restart the
+    /// hardware host afterwards so new sensors appear.
+    pub(super) fn install_tool(&mut self, label: &str, id: &str, restart_hw: bool) {
+        let flag = self.installing.clone();
+        *flag.lock().unwrap() = Some(label.to_string());
+        let tx = self.tx.clone();
+        let (label, id) = (label.to_string(), id.to_string());
+        std::thread::spawn(move || {
+            let r = crate::install::winget_install(&id);
+            if let Err(e) = r {
+                crate::log(&format!("Installing {label}: {e:#}"));
+            }
+            if restart_hw {
+                let _ = tx.send(Cmd::RestartHardware);
+            } else {
+                let _ = tx.send(Cmd::ReconnectLighting);
+            }
+            *flag.lock().unwrap() = None;
+        });
     }
 
     fn fan_editor(&mut self, ui: &mut egui::Ui, id: &str, sensors: &[Sensor], temps: &HashMap<String, f64>, decision: Option<&Decision>, busy: bool) {

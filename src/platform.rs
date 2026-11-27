@@ -48,9 +48,9 @@ pub fn running() -> bool {
 
 /// Start Stellar elevated: through its scheduled task when installed (no
 /// prompt), otherwise with a single Windows elevation prompt.
-pub fn relaunch_elevated(args: &[String]) -> bool {
+pub fn relaunch_elevated(args: &[String], use_task: bool) -> bool {
     use std::os::windows::process::CommandExt;
-    let task = std::process::Command::new("schtasks")
+    let task = use_task && std::process::Command::new("schtasks")
         .args(["/Run", "/TN", "Stellar"])
         .creation_flags(0x0800_0000)
         .output()
@@ -125,6 +125,12 @@ pub fn watch(name: &str, f: impl Fn() + Send + 'static) {
         }
         f();
     });
+}
+
+/// A simple Windows message box; returns the button id (IDYES, IDNO, ...).
+pub fn message(text: &str, flags: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_SETFOREGROUND, MessageBoxW};
+    unsafe { MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide("Stellar").as_ptr(), flags | MB_SETFOREGROUND) }
 }
 
 pub fn attach_console() {

@@ -1,111 +1,122 @@
-# Cooling & Lighting → Stellar
+<p align="center"><img src="assets/stellar.png" width="96" alt=""></p>
 
-**Stellar** ([`stellar/`](stellar/README.md)) is the Rust successor to the app below. It manages every fan header, the GPU fan and all OpenRGB lighting. Its cooling works like Fan Control (reusable curves, start/stop speeds, step rates), and it adds auto-tuning, effects and automation. Install it with `stellar\build.ps1` and then `stellar\install.ps1`. `stellar\restore-legacy.ps1` rolls back to the app described below.
+<h1 align="center">Stellar</h1>
+<p align="center"><b>All your PC's fans and RGB lighting in one place, for Windows.</b><br>
+Fan curves like Fan Control, synced effects like the RGB suites, plus auto-tuning, without vendor bloat.</p>
 
 ---
 
-The independent native application is now installed at
-`%LOCALAPPDATA%\Programs\CoolingLighting\CoolingLighting.exe`.
-The desktop shortcut and `CoolingLighting-Native` scheduled task launch it.
-The old Python app is stopped and its startup shortcut archived; Fan Control is
-stopped and its task disabled. The old installation is retained for rollback
-until a real Windows restart has been checked. See [`native/`](native/README.md).
+## Features
 
-Imported fans remain in firmware mode, preserving the legacy configuration's
-unassigned curves. Full-speed actuation and return to firmware were checked on
-both motherboard channels and the RTX 5070. Restart/suspend testing is pending.
+- **Every fan you have.** Motherboard fan headers (including fan hubs) and graphics-card fans, through [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor).
+- **Fan Control-style curves.** Several fans can share one curve. Curve types:
+  - **Graph:** draggable points over one or more sensors.
+  - **Linear** and **Flat**.
+  - **Trigger:** switches between idle and load speeds, with hysteresis.
+  - **Mix:** for example, the hotter of the CPU and GPU curves.
+  - Every curve can have a **response time** (smoothing).
 
-## Legacy Python app (rollback only)
+  Each fan also has start and stop speeds, step-up and step-down rates, an offset and hysteresis.
+- **Auto-tune.** Click once and Stellar sweeps each header, learns where your fans stall and restart, and finds the point where extra speed adds little airflow. It then builds quiet CPU, GPU and case curves. It handles fan hubs, and has an AIO liquid-cooler mode.
+- **Safety first.** Fans go to 100% instantly if a sensor disappears or goes stale, a fan stalls, or a temperature limit is hit. If Stellar ever crashes or hangs, all fans return to your motherboard's own control within 10 seconds.
+- **RGB from every brand.** Motherboard headers, RAM, GPUs, Corsair/NZXT controllers, keyboards: anything [OpenRGB](https://openrgb.org) supports.
+  - Effects: static, breathing, spectrum, rainbow wave, gradient, and **temperature-reactive** colour.
+  - Per-device effects, brightness, and quiet hours.
+- **Profiles and automation.** Save complete setups and switch automatically while a program runs (for example, a game).
+- **Lightweight.** A small native app that lives in the tray, starts with Windows, and sends no telemetry.
 
-A shared Windows control centre for RGB lighting and your installed Fan Control.
-Double-click the tray icon to open the dashboard. Run `python main.py --show`
-to open the window immediately; without `--show` it starts quietly in the tray.
-Opening it again raises the existing window rather than starting a second instance.
+## Install
 
-## Fan Control integration
+1. Download **`Stellar-x.y.z-win-x64.zip`** from [Releases](../../releases/latest) and extract it anywhere.
+2. Run **`stellar.exe`** and choose **Yes** to install. Approve the Windows administrator prompt once.
+   - Stellar installs for your account in `%LOCALAPPDATA%\Programs\Stellar`.
+   - It adds Start menu and desktop shortcuts and appears in **Settings › Apps**.
+   - It starts elevated at sign-in through its own scheduled task, so there's **no prompt at each startup**.
+3. If the **PawnIO** driver is missing, Stellar offers to install it. PawnIO is the free, signed driver LibreHardwareMonitor uses to reach motherboard fans and CPU temperatures.
+4. Open **Cooling** and click **Auto-tune**. Untick any header with a **pump** on it; headers that look like pumps are unticked for you.
+5. Optional: open **Lighting**, choose **Let Stellar control lighting**, and let Stellar install OpenRGB if needed.
 
-Fan Control remains the cooling engine, with its own drivers, calibrations,
-curves and Windows startup task. Its source is closed; this app integrates with
-the installed program through its supported configuration command line.
+To try Stellar without installing it, choose **No** at the install prompt (or run `stellar.exe --portable`).
 
-The dashboard discovers installed cooling profiles and shows their saved fan
-settings. Select a profile and choose **Apply profile** to send it to Fan Control.
-Windows may request elevation because Fan Control runs as administrator. A sent
-command is not confirmation of a profile change; verify live settings in the editor.
-**Fan curves & live sensors** opens the installed editor for live temperatures,
-RPM readings, curve editing and calibration. The dashboard table is saved profile
-data, not live telemetry. **Save profile copy** and **Import profile** preserve
-calibration and curves in `%LOCALAPPDATA%\RGBTrayController\FanProfiles` without
-overwriting installed profiles. Fan Control owns persistence of its active cooling
-configuration; RGB settings are saved separately by this app.
+> **"Windows protected your PC"?** Stellar isn't code-signed yet. Click **More info › Run anyway**. Some antivirus tools flag every hardware monitor because they load a kernel driver. Stellar uses PawnIO, the signed driver LibreHardwareMonitor itself uses. All source code is in this repository.
 
-Fan Control is detected under Program Files; portable installs can set
-`FANCONTROL_PATH` to the full path of `FanControl.exe`. If Fan Control isn't
-running, the app tries the existing `FanControl` Windows scheduled task.
-Quitting this app leaves Fan Control running so cooling continues.
+### Requirements
 
-Integration reference: [Fan Control's supported configuration and window commands](https://getfancontrol.com/docs/#command-line-arguments).
+- Windows 10 or 11, 64-bit.
+- An administrator account. Fan headers and CPU sensors need elevation; Stellar asks once, at install.
+- For motherboard fans: a board whose Super I/O chip LibreHardwareMonitor supports (most Nuvoton, ITE and Fintek chips on desktop boards). Graphics-card fans work on NVIDIA and AMD.
+- For lighting: OpenRGB. Stellar installs it on request.
 
-A small Windows system-tray app to turn your PC's RGB lighting on/off and set
-its color, via [OpenRGB](https://openrgb.org) — free and open-source, works
-across most RGB motherboards/RAM/GPUs/keyboards regardless of brand (no
-vendor SDK, no account, no cloud).
+## Using it
 
-## Setup
+- **Overview:** temperatures with 10-minute graphs, every fan's speed and what controls it, and recent activity.
+- **Cooling:**
+  - **Fan cards:** each fan can be on firmware control, follow a curve, or run at a manual speed.
+  - **Curves:** create and edit them in the library below the fan cards.
+  - **Auto-tune / Re-run auto-tune:** measures your fans.
+  - **Rebuild curves:** re-applies tuning without a new sweep, for example after switching **CPU cooler** between Air and AIO.
+- **Lighting:** global effect, per-device effects, LED counts for addressable headers, and quiet hours.
+- **Profiles & automation:** save and apply complete setups, or switch automatically while a program runs.
+- **Tray:** click to open, right-click for lighting on/off, profiles and Quit. The icon turns red while a safety override is active.
 
-1. Install [OpenRGB](https://openrgb.org/) and launch it once so it detects
-   your devices. The tray app will start OpenRGB's local SDK server when it
-   is not already running. A non-standard install can be specified with the
-   `OPENRGB_PATH` environment variable.
-2. From this folder:
-   ```
-   python -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt
-   ```
-3. Run it:
-   ```
-   .venv\Scripts\python main.py
-   ```
-   Or, to run without a console window staying open:
-   ```
-   .venv\Scripts\pythonw main.py
-   ```
+Closing the window keeps Stellar running in the tray, so your fan curves stay active. **Quit Stellar** returns every fan to firmware control.
 
-## Use
+### Other fan and RGB software
 
-A circular icon appears in the system tray:
+Stellar won't fight other programs.
 
-- **Colored** = on, showing that color
-- **Gray** = off
-- **Red** = waiting for OpenRGB, a lighting command failed, or settings could
-  not be saved; hover over the icon for status. Connection failures retry automatically.
+- **Fan Control, Argus Monitor or SpeedFan running:** Stellar leaves all fans on firmware control until they exit.
+- **MSI Afterburner running:** Stellar leaves the graphics card's fans to Afterburner and keeps controlling everything else.
+- **Other RGB apps** (Armoury Crate, iCUE, SignalRGB, …): close them before letting Stellar control lighting.
 
-Double-click opens Cooling & Lighting. Right-click for the full
-menu: preset colors, **Custom Color...** (opens a color picker), reconnect,
-and quit.
+### Command line
 
-Your color, on/off state, and fan LED counts are saved immediately whenever
-you change them, in `%LOCALAPPDATA%\RGBTrayController\config.json`. Writes
-are flushed to disk and replaced atomically, with a backup for recovery.
-Existing `config.json` settings next to `main.py` migrate automatically.
-You do not need to quit the app before shutting down Windows.
+```
+stellar              open the dashboard (or the running instance)
+stellar --tray       start in the tray
+stellar --quit       return fans to firmware control and exit
+stellar --autotune   tune every non-pump fan (running instance)
+stellar --install    install or update from this folder
+stellar --uninstall  remove Stellar (settings are kept)
+stellar --portable   run without installing
+stellar status       one-off hardware reading as JSON
+stellar rgb          list OpenRGB devices
+```
 
-At sign-in the app restores that state, retrying every five seconds if
-OpenRGB is still starting. It also reconnects after an SDK server restart.
-Only one tray instance can run at a time. Errors are recorded in
-`%LOCALAPPDATA%\RGBTrayController\app.log`.
+## Uninstall
 
-Controllers whose LED zones default to zero can also be configured there.
-`zone_sizes` maps the OpenRGB device and zone names to their physical LED
-counts; the app restores these sizes whenever the SDK server restarts.
+Use **Settings › Apps › Stellar › Uninstall**, or run `stellar --uninstall`. Fans return to firmware control. Your settings stay in `%LOCALAPPDATA%\Programs\Stellar\Data`; delete that folder to remove them too.
 
-## Notes
+## How it works
 
-- "Off" uses each device's own hardware Off mode when it has one; devices
-  that don't expose one (most peripherals only have Direct/Static/Effect
-  modes) are set to black instead — still fully dark, just not power-off.
-- Everything runs locally against `127.0.0.1:6742`; nothing leaves your
-  machine.
-- Not code-signed — Windows SmartScreen may warn on first run of a script
-  from an unfamiliar source. It's a plain Python script; read `main.py`
-  yourself if you want to verify that before running it.
+| Path | Purpose |
+|---|---|
+| `src/engine.rs` | control loop thread: reads sensors every second, applies fan policy, renders lighting |
+| `src/cooling.rs` | fan policy and safeguards, output ownership, tuning maths |
+| `src/curves.rs` | curve types, validation, evaluation and smoothing |
+| `src/tuning.rs` | auto-tune sweep and curve builder |
+| `src/openrgb.rs`, `src/lighting.rs` | native OpenRGB SDK client and effects engine |
+| `src/config.rs` | settings, profiles, atomic saves and migration |
+| `src/install.rs` | self-installer, sign-in task, Apps & Features entry |
+| `src/ui.rs`, `src/ui/` | dashboard (egui) and tray |
+| `hwhost/` | `stellar-hw`, a small LibreHardwareMonitor host (C#) |
+
+Sensor reads and fan writes go through `stellar-hw`, a small LibreHardwareMonitor host process. It returns every fan it touched to firmware control when Stellar exits or crashes, or when Stellar stops responding for 10 seconds.
+
+Settings are saved atomically with a backup copy. If both copies are damaged, fans stay on firmware control rather than guessing.
+
+### Build from source
+
+Requires Rust (stable, MSVC toolchain), the .NET 8 SDK and Windows.
+
+```powershell
+.\build.ps1          # tests, release build, self-contained hardware host -> .\dist\Stellar + zip
+```
+
+Releases are built by GitHub Actions when a `v*` tag is pushed (`.github/workflows/release.yml`).
+
+## License
+
+MIT; see [LICENSE](LICENSE). Bundled components are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+The `legacy/` folder holds Stellar's predecessors: a Python RGB tray app and a C# WPF app.

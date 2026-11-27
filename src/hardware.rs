@@ -155,11 +155,14 @@ pub fn running_processes() -> std::collections::HashSet<String> {
 /// Another program that writes fan duty cycles, if one is running.
 pub fn competing_writer(procs: &std::collections::HashSet<String>) -> Option<&'static str> {
     let running = |n: &str| procs.contains(&n.to_lowercase());
-    if running("FanControl") {
-        Some("Fan Control")
-    } else if running("CoolingLighting") {
-        Some("Cooling & Lighting")
-    } else {
-        None
-    }
+    // Programs that write motherboard fan duty cycles.
+    [("FanControl", "Fan Control"), ("CoolingLighting", "Cooling & Lighting"), ("ArgusMonitor", "Argus Monitor"), ("speedfan", "SpeedFan")]
+        .into_iter()
+        .find(|(p, _)| running(p))
+        .map(|(_, name)| name)
+}
+
+/// Programs that write graphics card fan speeds.
+pub fn competing_gpu_writer(procs: &std::collections::HashSet<String>) -> Option<&'static str> {
+    procs.contains("msiafterburner").then_some("MSI Afterburner")
 }

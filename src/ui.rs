@@ -89,6 +89,8 @@ struct App {
     confirm_quit: bool,
     selected_curve: Option<String>,
     show_unused: bool,
+    tune_dialog: Option<Vec<(String, String, bool)>>,
+    installing: Arc<Mutex<Option<String>>>,
     /// Developer aid: STELLAR_SNAPSHOT=dir saves a PNG of every page and exits.
     snapshot: Option<(std::path::PathBuf, usize, u32)>,
 }
@@ -156,6 +158,8 @@ impl App {
             confirm_quit: false,
             selected_curve: None,
             show_unused: false,
+            tune_dialog: None,
+            installing: Arc::new(Mutex::new(None)),
             snapshot: std::env::var_os("STELLAR_SNAPSHOT").map(|d| (d.into(), 0, 0)),
         }
     }
@@ -483,9 +487,10 @@ impl eframe::App for App {
 
 impl App {
     fn overview(&mut self, ui: &mut egui::Ui) {
-        let s = self.state.lock().unwrap();
         heading(ui, "Overview");
         ui.add_space(6.0);
+        self.pawnio_banner(ui);
+        let s = self.state.lock().unwrap();
         let cpu = s.history.back().and_then(|h| h.0);
         let gpu = s.history.back().and_then(|h| h.1);
         let cpu_load = s.snapshot.sensors.iter().find(|x| x.kind == "Load" && x.id.contains("cpu") && x.name == "CPU Total").and_then(|x| x.value);
@@ -568,17 +573,56 @@ impl App {
         let devices = s.devices.clone();
         let sensors: Vec<Sensor> = s.snapshot.sensors.iter().filter(|x| x.kind == "Temperature").cloned().collect();
         let status = (s.lighting_ok, s.lighting_status.clone());
+        let openrgb = s.openrgb_installed;
         drop(s);
         let before = self.draft.lighting.clone();
         let t = self.started.elapsed().as_secs_f64();
         let temps: HashMap<String, f64> = sensors.iter().filter_map(|x| Some((x.id.clone(), x.value?))).collect();
         heading(ui, "Lighting");
+        if !self.committed.lighting.managed {
+            card(ui, |ui| {
+                ui.label(RichText::new("Stellar isn't controlling your RGB lighting").strong());
+                ui.label(RichText::new("Stellar drives every RGB device OpenRGB supports — motherboard headers, RAM, GPUs, fan controllers, keyboards — with synced effects, including colours that follow your temperatures. While it's in control, other RGB apps (Armoury Crate, iCUE, SignalRGB…) should be closed so they don't fight over the lights.").size(12.5).color(MUTED));
+                if ui.add(egui::Button::new(RichText::new("Let Stellar control lighting").strong()).fill(VIOLET)).clicked() {
+                    let mut new = self.committed.clone();
+                    new.lighting.managed = true;
+                    self.send(Cmd::Save(new));
+                }
+            });
+            return;
+        }
         ui.horizontal(|ui| {
             chip(ui, &status.1, if status.0 { GOOD } else { GOLD });
             if ui.small_button("Reconnect").clicked() {
                 self.send(Cmd::ReconnectLighting);
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Stop controlling lighting").on_hover_text("Stellar lets go of all RGB devices; other apps can take over.").clicked() {
+                    let mut new = self.committed.clone();
+                    new.lighting.managed = false;
+                    self.send(Cmd::Save(new));
+                }
+            });
         });
+        if !openrgb {
+            card(ui, |ui| {
+                ui.label(RichText::new("Lighting needs OpenRGB").strong().color(GOLD));
+                ui.label(RichText::new("OpenRGB is the free, open-source backend Stellar uses to talk to RGB devices from any brand. Stellar starts it in the background; you never need to open it.").size(12.5).color(MUTED));
+                let busy = self.installing.lock().unwrap().clone();
+                ui.horizontal(|ui| match busy {
+                    Some(what) => {
+                        ui.spinner();
+                        ui.label(format!("Installing {what}…"));
+                    }
+                    None => {
+                        if ui.add(egui::Button::new("Install OpenRGB").fill(VIOLET)).clicked() {
+                            self.install_tool("OpenRGB", "OpenRGB.OpenRGB", false);
+                        }
+                        ui.hyperlink_to("openrgb.org", "https://openrgb.org");
+                    }
+                });
+            });
+        }
         ui.add_space(6.0);
         let l = &mut self.draft.lighting;
         card(ui, |ui| {
@@ -793,7 +837,7 @@ impl App {
         card(ui, |ui| {
             sub(ui, "BEHAVIOUR");
             ui.checkbox(&mut self.draft.notifications, "Turn the tray icon red while a cooling safeguard is active");
-            ui.label(RichText::new("Closing the window keeps Stellar in the tray so cooling continues. Startup with Windows is configured by install.ps1 as an elevated scheduled task.").color(MUTED).size(12.5));
+            ui.label(RichText::new("Closing the window keeps Stellar in the tray so cooling continues. Stellar starts with Windows through its own elevated sign-in task, so there is no prompt at startup. To remove it, use Windows Settings › Apps › Stellar.").color(MUTED).size(12.5));
         });
         ui.add_space(8.0);
         if ui.add(egui::Button::new(RichText::new("Quit Stellar").strong()).fill(BAD.gamma_multiply(0.5))).clicked() {

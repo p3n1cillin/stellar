@@ -6,6 +6,7 @@ mod cooling;
 mod curves;
 mod engine;
 mod hardware;
+mod install;
 mod lighting;
 mod openrgb;
 mod platform;
@@ -34,6 +35,9 @@ const HELP: &str = "Stellar — cooling & lighting control centre
   stellar --tray     start quietly in the system tray
   stellar --quit     ask the running instance to return fans to firmware and exit
   stellar --autotune measure every fan and apply tuned curves (running instance)
+  stellar --install  install or update from this folder (asks for elevation)
+  stellar --uninstall remove Stellar (settings are kept)
+  stellar --portable run this copy without installing
   stellar status     print a one-off hardware reading as JSON
   stellar rgb        list OpenRGB devices
   stellar --help";
@@ -80,13 +84,59 @@ fn main() {
         });
     }
 
+    if has("--install") || has("--uninstall") {
+        if !platform::is_admin() {
+            platform::relaunch_elevated(&args, false);
+            return;
+        }
+        if has("--install") {
+            run_install();
+        } else {
+            run_uninstall(has("--purge"));
+        }
+        return;
+    }
+
     // Stellar always runs elevated: fan headers and CPU sensors need it. A
     // normal launch (desktop shortcut) raises the running instance or starts
     // the elevated one, never a limited dashboard.
     if !platform::is_admin() && std::env::var_os("STELLAR_SNAPSHOT").is_none() && !has("--no-elevate") {
         if platform::running() {
             platform::signal(platform::SHOW_EVENT);
-        } else if platform::relaunch_elevated(&args) && !has("--tray") {
+            return;
+        }
+        let mut args = args.clone();
+        let mut use_task = install::is_installed_copy();
+        if !use_task && !has("--portable") {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{IDNO, IDYES, MB_ICONQUESTION, MB_YESNOCANCEL};
+            let text = if install::is_installed() {
+                "Stellar is already installed.
+
+Yes: update the installed copy with this version
+No: just run this copy
+Cancel: do nothing"
+            } else {
+                "Install Stellar?
+
+It installs for your account, starts with Windows (elevated, without a prompt each time) and appears in Apps & Features.
+
+Yes: install
+No: just run this copy without installing
+Cancel: do nothing"
+            };
+            match platform::message(text, MB_YESNOCANCEL | MB_ICONQUESTION) {
+                IDYES => {
+                    platform::relaunch_elevated(&["--install".to_string()], false);
+                    return;
+                }
+                IDNO => args.push("--portable".into()),
+                _ => return,
+            }
+        }
+        if has("--portable") {
+            use_task = false;
+        }
+        if platform::relaunch_elevated(&args, use_task) && !has("--tray") {
             for _ in 0..40 {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 if platform::running() {
@@ -114,7 +164,7 @@ fn main() {
     {
         let tx = tx.clone();
         platform::watch(platform::AUTOTUNE_EVENT, move || {
-            let _ = tx.send(engine::Cmd::AutoTune);
+            let _ = tx.send(engine::Cmd::AutoTune(None));
         });
     }
     let result = ui::run(state.clone(), tx.clone(), repaint, has("--tray"));
@@ -123,6 +173,61 @@ fn main() {
     }
     let _ = tx.send(engine::Cmd::Quit);
     let _ = engine.join();
+}
+
+fn run_install() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_YESNO};
+    if !install::pawnio_installed()
+        && platform::message(
+            "Stellar needs the free PawnIO driver to read CPU temperatures and control motherboard fan headers.
+
+Install PawnIO now with winget? (A console window shows progress.)",
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+        && let Err(e) = install::winget_install("namazso.PawnIO")
+    {
+        platform::message(&format!("PawnIO could not be installed automatically ({e}).
+
+Get it from https://pawnio.eu and restart Stellar. Stellar will still install."), MB_ICONERROR);
+    }
+    match install::install() {
+        Ok(()) => {
+            install::start_task();
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if platform::running() {
+                    platform::signal(platform::SHOW_EVENT);
+                    break;
+                }
+            }
+        }
+        Err(e) => {
+            log(&format!("Install failed: {e:#}"));
+            platform::message(&format!("Stellar could not be installed:
+
+{e:#}"), MB_ICONERROR);
+        }
+    }
+}
+
+fn run_uninstall(purge: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL};
+    let text = "Uninstall Stellar?
+
+Fans return to motherboard/graphics card control and lighting stops updating. Your settings are kept in %LOCALAPPDATA%\\Programs\\Stellar\\Data.";
+    if platform::message(text, MB_OKCANCEL | MB_ICONQUESTION) != IDOK {
+        return;
+    }
+    match install::uninstall(purge) {
+        Ok(()) => {
+            platform::message("Stellar has been removed.", MB_ICONINFORMATION);
+        }
+        Err(e) => {
+            platform::message(&format!("Stellar could not be removed:
+
+{e:#}"), MB_ICONERROR);
+        }
+    }
 }
 
 fn cli_status() -> anyhow::Result<()> {

@@ -180,6 +180,11 @@ impl Lighting {
             .collect()
     }
 
+    /// Whether this engine holds a connection, lock or server.
+    pub fn active(&self) -> bool {
+        self.client.is_some() || self.lease.is_some() || self.server.is_some()
+    }
+
     pub fn reconnect(&mut self) {
         self.client = None;
         self.retry_at = Instant::now();
@@ -204,7 +209,7 @@ impl Lighting {
             .chain(pf("ProgramFiles(x86)"))
             .find(|p| p.exists());
         let Some(path) = candidate else {
-            crate::log("OpenRGB not found; set OPENRGB_PATH for a portable installation");
+            self.status = "OpenRGB is not installed".into();
             return;
         };
         let mut cmd = Command::new(path);

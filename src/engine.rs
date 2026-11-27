@@ -4,7 +4,7 @@
 use crate::config::{FanMode, Profile, Settings, Store};
 use crate::cooling::{Decision, Outputs, Sensor, cpu_temperature, gpu_temperature};
 use crate::tuning::{AutoTune, Progress};
-use crate::hardware::{Host, Snapshot, competing_writer, running_processes};
+use crate::hardware::{Host, Snapshot, competing_gpu_writer, competing_writer, running_processes};
 use crate::lighting::{DeviceInfo, Lighting};
 use chrono::Timelike;
 use std::collections::{HashMap, VecDeque};
@@ -21,8 +21,11 @@ pub enum Cmd {
     DeleteProfile(String),
     /// Measure one fan and store its calibration and limits.
     TuneFan(String),
-    /// Measure every fan and apply tuned curves.
-    AutoTune,
+    /// Measure fans and apply tuned curves: the chosen headers, or every
+    /// header that doesn't look like a pump.
+    AutoTune(Option<Vec<String>>),
+    /// Restart the hardware host (e.g. after installing the PawnIO driver).
+    RestartHardware,
     CancelTuning,
     /// Rebuild tuned curves from stored measurements (no sweep), e.g. after
     /// changing the CPU cooler type.
@@ -49,6 +52,10 @@ pub struct Shared {
     pub notices: VecDeque<String>,
     pub warning: Option<String>,
     pub competing: Option<&'static str>,
+    pub gpu_competing: Option<&'static str>,
+    /// PawnIO driver present (needed for motherboard fans and CPU temperatures).
+    pub pawnio: bool,
+    pub openrgb_installed: bool,
     pub auto_profile: Option<String>,
     pub emergency: bool,
     pub stopped: bool,
@@ -73,6 +80,7 @@ pub fn now_ms() -> i64 {
 }
 
 struct Engine {
+    gpu_competing: Option<&'static str>,
     /// When the hardware host first answered; sensors need a moment to populate.
     first_read: Option<Instant>,
     state: State,
@@ -118,6 +126,7 @@ pub fn spawn(state: State, rx: Receiver<Cmd>, repaint: Box<dyn Fn() + Send>) -> 
                 last_competing_check: None,
                 last_auto_check: Instant::now(),
                 first_read: None,
+                gpu_competing: None,
                 tuning: None,
                 temps: HashMap::new(),
                 was_emergency: false,
@@ -161,7 +170,13 @@ impl Engine {
             }
             let minute = { let n = chrono::Local::now(); n.hour() * 60 + n.minute() };
             let quiet = self.settings.lighting.quiet_hours.is_some_and(|q| q.contains(minute));
-            self.lighting.tick(&self.settings.lighting, start.elapsed().as_secs_f64(), &self.temps, quiet);
+            if self.settings.lighting.managed {
+                self.lighting.tick(&self.settings.lighting, start.elapsed().as_secs_f64(), &self.temps, quiet);
+            } else if self.lighting.active() {
+                // Control was switched off: let go of devices, the lock and our server.
+                self.lighting.shutdown();
+                self.lighting = Lighting::new();
+            }
             {
                 let mut s = self.state.lock().unwrap();
                 if s.lighting_status != self.lighting.status || s.lighting_ok != self.lighting.ok {
@@ -250,6 +265,9 @@ impl Engine {
                 Cmd::SetLighting(on) => {
                     let mut new = self.settings.clone();
                     new.lighting.on = on;
+                    if on {
+                        new.lighting.managed = true;
+                    }
                     self.commit(new)?;
                     None
                 }
@@ -257,8 +275,14 @@ impl Engine {
                     self.lighting.reconnect();
                     Some("Reconnecting lighting".into())
                 }
-                Cmd::TuneFan(control) => self.start_tuning(Some(control))?,
-                Cmd::AutoTune => self.start_tuning(None)?,
+                Cmd::TuneFan(control) => self.start_tuning(Some(vec![control]), false)?,
+                Cmd::AutoTune(only) => self.start_tuning(only, true)?,
+                Cmd::RestartHardware => {
+                    self.outputs.release_all(&mut self.host, &mut vec![]);
+                    self.host.shutdown();
+                    self.first_read = None;
+                    Some("Hardware monitoring restarted".into())
+                }
                 Cmd::RebuildCurves(cooler) => {
                     if self.tuning.is_some() {
                         anyhow::bail!("Wait for auto-tune to finish");
@@ -293,7 +317,7 @@ impl Engine {
         }
     }
 
-    fn start_tuning(&mut self, only: Option<String>) -> anyhow::Result<Option<String>> {
+    fn start_tuning(&mut self, only: Option<Vec<String>>, apply: bool) -> anyhow::Result<Option<String>> {
         if self.tuning.is_some() {
             anyhow::bail!("Auto-tune is already running");
         }
@@ -301,12 +325,15 @@ impl Engine {
             anyhow::bail!("{c} is running; quit it before tuning fans");
         }
         let sensors = self.state.lock().unwrap().snapshot.sensors.clone();
-        let targets = crate::tuning::targets(&sensors, &self.settings, only.as_deref());
+        let mut targets = crate::tuning::targets(&sensors, &self.settings, only.as_deref());
+        if self.gpu_competing.is_some() {
+            targets.retain(|t| !t.control.starts_with("/gpu-"));
+        }
         if targets.is_empty() {
             anyhow::bail!("No fan outputs with RPM sensors were found");
         }
         let n = targets.len();
-        self.tuning = Some(AutoTune::new(targets, only.is_none()));
+        self.tuning = Some(AutoTune::new(targets, apply));
         Ok(Some(format!("Auto-tune started for {n} fan header{} — about {} minutes. Fans will speed up, slow down and briefly stop.", if n == 1 { "" } else { "s" }, (n * 75).div_ceil(60))))
     }
 
@@ -375,8 +402,29 @@ impl Engine {
     fn hardware_tick(&mut self) {
         if self.last_competing_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             self.last_competing_check = Some(Instant::now());
-            self.competing = competing_writer(&running_processes());
+            let procs = running_processes();
+            self.competing = competing_writer(&procs);
+            self.gpu_competing = competing_gpu_writer(&procs);
+            let (pawnio, openrgb) = (crate::install::pawnio_installed(), crate::install::openrgb_installed());
+            let mut s = self.state.lock().unwrap();
+            s.pawnio = pawnio;
+            s.openrgb_installed = openrgb;
+            s.gpu_competing = self.gpu_competing;
         }
+        // A GPU tool such as MSI Afterburner owns the graphics card's fans:
+        // leave those on firmware/that tool, keep controlling everything else.
+        let rules: Vec<crate::config::FanRule> = self
+            .settings
+            .fans
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                if self.gpu_competing.is_some() && r.control_id.starts_with("/gpu-") {
+                    r.mode = FanMode::Firmware;
+                }
+                r
+            })
+            .collect();
         let mut errors = vec![];
         let (snapshot, read_error) = match self.host.read() {
             Ok(s) => (s, None),
@@ -409,7 +457,7 @@ impl Engine {
             // already returned outputs to firmware if it is unresponsive.
             Err(anyhow::anyhow!(read_error.clone().unwrap()))
         } else {
-            self.outputs.apply(&self.settings.fans, &self.settings.curves, &sensors, &mut self.host, snapshot.admin, self.competing, now, &mut errors)
+            self.outputs.apply(&rules, &self.settings.curves, &sensors, &mut self.host, snapshot.admin, self.competing, now, &mut errors)
         };
         let (decisions, status, ok) = match applied {
             Ok(d) => {
