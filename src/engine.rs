@@ -80,6 +80,7 @@ pub fn now_ms() -> i64 {
 }
 
 struct Engine {
+    last_status_file: Option<Instant>,
     gpu_competing: Option<&'static str>,
     /// When the hardware host first answered; sensors need a moment to populate.
     first_read: Option<Instant>,
@@ -127,6 +128,7 @@ pub fn spawn(state: State, rx: Receiver<Cmd>, repaint: Box<dyn Fn() + Send>) -> 
                 last_auto_check: Instant::now(),
                 first_read: None,
                 gpu_competing: None,
+                last_status_file: None,
                 tuning: None,
                 temps: HashMap::new(),
                 was_emergency: false,
@@ -500,6 +502,39 @@ impl Engine {
         s.history.push_back((cpu, gpu));
         while s.history.len() > HISTORY {
             s.history.pop_front();
+        }
+        // Live status file for diagnostics (readable without elevation).
+        if self.last_status_file.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            self.last_status_file = Some(Instant::now());
+            let fans: Vec<serde_json::Value> = snapshot
+                .sensors
+                .iter()
+                .filter(|x| x.kind == "Control" && x.can_control)
+                .map(|o| {
+                    let rule = self.settings.rule(&o.id);
+                    let rpm_id = rule.and_then(|r| r.rpm_sensor_id.clone()).unwrap_or_else(|| crate::cooling::paired_rpm(&o.id));
+                    let d = decisions.get(&o.id);
+                    serde_json::json!({
+                        "id": o.id, "name": rule.map(|r| r.name.clone()).unwrap_or(o.name.clone()),
+                        "duty": o.value, "rpm": snapshot.sensors.iter().find(|x| x.id == rpm_id).and_then(|x| x.value),
+                        "mode": rule.map(|r| format!("{:?}", r.mode)).unwrap_or("Unmanaged".into()),
+                        "target": d.and_then(|d| d.percent), "reason": d.map(|d| d.reason.clone()), "emergency": d.is_some_and(|d| d.emergency),
+                    })
+                })
+                .collect();
+            let temps: Vec<serde_json::Value> = snapshot
+                .sensors
+                .iter()
+                .filter(|x| x.kind == "Temperature")
+                .map(|x| serde_json::json!({"id": x.id, "hardware": x.hardware, "name": x.name, "value": x.value}))
+                .collect();
+            let doc = serde_json::json!({
+                "time": chrono::Local::now().to_rfc3339(), "status": status, "cpu": cpu, "gpu": gpu,
+                "fans": fans, "temperatures": temps, "lighting": self.lighting.status,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
+                let _ = crate::config::atomic_write(&self.store.dir.join("status.json"), &bytes);
+            }
         }
         s.snapshot = snapshot;
         s.decisions = decisions;
