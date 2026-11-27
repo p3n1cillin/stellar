@@ -271,12 +271,33 @@ pub struct DeviceLighting {
     pub enabled: bool,
     /// None follows the global effect.
     pub effect: Option<Effect>,
+    /// Run one of the device's own built-in effects instead of Stellar's
+    /// (e.g. a QMK keyboard's Typing Heatmap). The device renders it itself.
+    pub onboard: Option<OnboardMode>,
+    /// Per-key colours (LED index → colour) painted over Stellar's effect.
+    pub keys: BTreeMap<u32, Rgb>,
 }
 
 impl Default for DeviceLighting {
     fn default() -> Self {
-        Self { enabled: true, effect: None }
+        Self { enabled: true, effect: None, onboard: None, keys: BTreeMap::new() }
     }
+}
+
+/// A device's built-in (hardware) effect and its settings. `None` values keep
+/// the device's defaults.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct OnboardMode {
+    pub mode: String,
+    pub speed: Option<u32>,
+    pub brightness: Option<u32>,
+    /// OpenRGB direction: 0 left, 1 right, 2 up, 3 down, 4 horizontal, 5 vertical.
+    pub direction: Option<u32>,
+    /// Mode colours; empty keeps the device's own.
+    pub colors: Vec<Rgb>,
+    /// Let the device pick random colours (where supported).
+    pub random: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -461,6 +482,9 @@ impl Store {
     /// packaged-host AppData redirection, so elevated scheduled launches and
     /// interactive launches see the same files.
     pub fn default_location() -> Self {
+        if let Some(d) = std::env::var_os("STELLAR_DATA_DIR") {
+            return Self::at(PathBuf::from(d));
+        }
         Self::at(local_app_data().join("Programs").join("Stellar").join("Data"))
     }
     pub fn at(dir: PathBuf) -> Self {

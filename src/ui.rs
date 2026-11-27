@@ -1,8 +1,9 @@
 //! Stellar dashboard (egui).
 
 mod cooling_page;
+mod device_panel;
 
-use crate::config::{AutoRule, DeviceLighting, Effect, FanMode, QuietHours, Rgb, Settings};
+use crate::config::{AutoRule, Effect, FanMode, QuietHours, Rgb, Settings};
 use crate::cooling::{Sensor, paired_rpm};
 use crate::engine::{Cmd, State};
 use crate::platform::{self, Window};
@@ -58,11 +59,20 @@ enum Page {
 
 pub fn run(state: State, tx: Sender<Cmd>, repaint: Arc<Mutex<Option<egui::Context>>>, start_hidden: bool) -> eframe::Result {
     let icon = egui::IconData { rgba: tray::star_rgba(64, Tone::Normal), width: 64, height: 64 };
+    // Fit the screen: never open larger than ~90% of the usable area, so it
+    // works on small laptops and at high display scaling.
+    let (sw, sh) = platform::work_area().unwrap_or((1920.0, 1040.0));
+    let mut initial = [1180.0f32.min(sw * 0.9), 780.0f32.min(sh * 0.88)];
+    if std::env::var_os("STELLAR_SNAPSHOT_TALL").is_some() {
+        initial = [1180.0, 2000.0]; // developer screenshots only
+    }
+    let minimum = [760.0f32.min(sw * 0.8), 500.0f32.min(sh * 0.7)];
     let options = eframe::NativeOptions {
+        centered: true,
         viewport: egui::ViewportBuilder::default()
             .with_title("Stellar")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size(initial)
+            .with_min_inner_size(minimum)
             .with_visible(!start_hidden)
             .with_icon(icon),
         ..Default::default()
@@ -90,6 +100,7 @@ struct App {
     selected_curve: Option<String>,
     show_unused: bool,
     tune_dialog: Option<Vec<(String, String, bool)>>,
+    brush: Rgb,
     installing: Arc<Mutex<Option<String>>>,
     /// Developer aid: STELLAR_SNAPSHOT=dir saves a PNG of every page and exits.
     snapshot: Option<(std::path::PathBuf, usize, u32)>,
@@ -159,6 +170,7 @@ impl App {
             selected_curve: None,
             show_unused: false,
             tune_dialog: None,
+            brush: [255, 40, 40],
             installing: Arc::new(Mutex::new(None)),
             snapshot: std::env::var_os("STELLAR_SNAPSHOT").map(|d| (d.into(), 0, 0)),
         }
@@ -353,7 +365,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if let Some((dir, page, frames)) = &mut self.snapshot {
+        if let Some((dir, page, frames)) = &mut self.snapshot
+            && self.started.elapsed().as_secs() >= 18
+        {
             const PAGES: [Page; 6] = [Page::Overview, Page::Cooling, Page::Lighting, Page::Profiles, Page::Sensors, Page::Settings];
             *frames += 1;
             self.page = PAGES[(*page).min(5)];
@@ -570,7 +584,18 @@ impl App {
 
     fn lighting(&mut self, ui: &mut egui::Ui) {
         let s = self.state.lock().unwrap();
-        let devices = s.devices.clone();
+        let mut devices = s.devices.clone();
+        if std::env::var_os("STELLAR_SNAPSHOT_DEMO").is_some() {
+            let kb = demo_keyboard();
+            let mut mouse = demo_keyboard();
+            mouse.name = "Demo device with built-in effects".into();
+            mouse.kind = 6;
+            self.draft.lighting.devices.entry(mouse.name.clone()).or_default().onboard =
+                Some(crate::config::OnboardMode { mode: "Breathing".into(), colors: vec![[255, 0, 120]], ..Default::default() });
+            self.draft.lighting.devices.entry(kb.name.clone()).or_default().keys.extend((33..37).map(|i| (i, [255, 40, 40])));
+            devices.insert(0, kb);
+            devices.insert(0, mouse);
+        }
         let sensors: Vec<Sensor> = s.snapshot.sensors.iter().filter(|x| x.kind == "Temperature").cloned().collect();
         let status = (s.lighting_ok, s.lighting_status.clone());
         let openrgb = s.openrgb_installed;
@@ -644,45 +669,15 @@ impl App {
             effect_editor(ui, &mut l.effect, &sensors, "global");
         });
         ui.add_space(8.0);
-        card(ui, |ui| {
-            sub(ui, "DEVICES");
-            if devices.is_empty() {
-                ui.label(RichText::new("No OpenRGB devices yet. Stellar starts the installed OpenRGB server automatically.").color(MUTED));
-            }
-            for d in &devices {
-                ui.separator();
-                let entry = l.devices.entry(d.name.clone()).or_insert_with(DeviceLighting::default);
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut entry.enabled, RichText::new(&d.name).strong());
-                    ui.label(RichText::new(format!("{} · {} LEDs", d.vendor, d.leds)).color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut custom = entry.effect.is_some();
-                        if ui.checkbox(&mut custom, "Own effect").changed() {
-                            entry.effect = custom.then(|| l.effect.clone());
-                        }
-                    });
-                });
-                if let Some(e) = &mut entry.effect {
-                    ui.indent(&d.name, |ui| effect_editor(ui, e, &sensors, &d.name));
-                }
-                if entry == &DeviceLighting::default() {
-                    l.devices.remove(&d.name);
-                }
-                let resizable: Vec<_> = d.zones.iter().filter(|z| z.3 > z.2).collect();
-                if !resizable.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        for (zone, count, min, max) in resizable {
-                            let sizes = l.zone_sizes.entry(d.name.clone()).or_default();
-                            let mut v = sizes.get(zone).copied().unwrap_or(*count);
-                            ui.label(RichText::new(zone).size(12.0).color(MUTED));
-                            if ui.add(egui::DragValue::new(&mut v).range(*min..=*max).suffix(" LEDs")).changed() {
-                                sizes.insert(zone.clone(), v);
-                            }
-                        }
-                    });
-                }
-            }
-        });
+        sub(ui, "DEVICES");
+        if devices.is_empty() {
+            ui.label(RichText::new("No RGB devices yet. Stellar starts OpenRGB in the background; devices appear once it has found them.").color(MUTED));
+        }
+        let mut actions = vec![];
+        for d in &devices {
+            device_panel::device_card(ui, d, l, &sensors, &temps, t, &mut self.brush, &mut actions);
+            ui.add_space(8.0);
+        }
         ui.add_space(8.0);
         card(ui, |ui| {
             sub(ui, "QUIET HOURS");
@@ -701,6 +696,15 @@ impl App {
         });
         if self.draft.lighting != before {
             self.lighting_changed();
+        }
+        for a in actions {
+            match a {
+                device_panel::DeviceAction::SaveToDevice(name) => {
+                    // Commit the latest settings first so the device gets exactly what is shown.
+                    self.flush_lighting(true);
+                    self.send(Cmd::SaveToDevice(name));
+                }
+            }
         }
     }
 
@@ -847,6 +851,36 @@ impl App {
 }
 
 // ---------------------------------------------------------------- widgets
+
+/// Snapshot-only demo device: a Keychron V3 Max's real 87-key layout.
+fn demo_keyboard() -> crate::lighting::DeviceInfo {
+    use crate::openrgb::{Mode, NO_LED, Zone};
+    let rows: [&[i32]; 6] = [
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, -1, 13, 14, 15],
+        &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+        &[33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
+        &[50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, -1, -1, -1, -1],
+        &[63, -1, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, -1, -1, 75, -1],
+        &[76, 77, 78, -1, -1, -1, 79, -1, -1, -1, 80, 81, 82, 83, 84, 85, 86],
+    ];
+    let map = rows.iter().flat_map(|r| r.iter().map(|&v| if v < 0 { NO_LED } else { v as u32 })).collect();
+    let legends = "Esc F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 PrtSc Lock Light ` 1 2 3 4 5 6 7 8 9 0 - = Backspace Insert Home PageUp Tab Q W E R T Y U I O P [ ] \\ Delete End PageDown Caps A S D F G H J K L ; ' Enter Shift Z X C V B N M , . / Shift Up Ctrl Win Alt Space Alt Fn Menu Ctrl Left Down Right";
+    let led_names = legends.split(' ').map(|k| format!("Key: {k}")).collect();
+    let mode = |name: &str, flags: u32| Mode {
+        name: name.into(), value: 0, flags, speed_min: 0, speed_max: 255, brightness_min: 0, brightness_max: 255, colors_min: 1, colors_max: 1,
+        speed: 127, brightness: 255, direction: 0, color_mode: 0, colors: vec![0xff],
+    };
+    crate::lighting::DeviceInfo {
+        name: "Keychron V3 Max (demo)".into(),
+        vendor: "Keychron".into(),
+        kind: 5,
+        leds: 87,
+        zones: vec![("Keyboard".into(), 87, 87, 87)],
+        layout: vec![Zone { name: "Keyboard".into(), kind: 2, leds_min: 87, leds_max: 87, leds_count: 87, matrix: Some((6, 17, map)) }],
+        led_names,
+        modes: vec![mode("Solid Color", 0x140), mode("Breathing", 0x141), mode("Cycle All", 0x191), mode("Typing Heatmap", 0x190), mode("Splash", 0x191)],
+    }
+}
 
 fn dot_label(ui: &mut egui::Ui, color: Color32, text: &str) {
     ui.horizontal(|ui| {

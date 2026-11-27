@@ -19,9 +19,12 @@ Fan curves like Fan Control, synced effects like the RGB suites, plus auto-tunin
   Each fan also has start and stop speeds, step-up and step-down rates, an offset and hysteresis.
 - **Auto-tune.** Click once and Stellar sweeps each header, learns where your fans stall and restart, and finds the point where extra speed adds little airflow. It then builds quiet CPU, GPU and case curves. It handles fan hubs, and has an AIO liquid-cooler mode.
 - **Safety first.** Fans go to 100% instantly if a sensor disappears or goes stale, a fan stalls, or a temperature limit is hit. If Stellar ever crashes or hangs, all fans return to your motherboard's own control within 10 seconds.
-- **RGB from every brand.** Motherboard headers, RAM, GPUs, Corsair/NZXT controllers, keyboards: anything [OpenRGB](https://openrgb.org) supports.
-  - Effects: static, breathing, spectrum, rainbow wave, gradient, and **temperature-reactive** colour.
-  - Per-device effects, brightness, and quiet hours.
+- **RGB from every brand.** Motherboard headers, RAM, GPUs, Corsair/NZXT controllers, keyboards, mice, headsets: anything [OpenRGB](https://openrgb.org) supports.
+  - **Synced effects** rendered by Stellar across all devices: static, breathing, spectrum, rainbow wave, gradient, and **temperature-reactive** colour.
+  - **Per-device customisation**, like a vendor's own customiser:
+    - Run any of the device's **built-in effects** (for example a QMK keyboard's Typing Heatmap or Splash), with its speed, brightness, direction and colours. **Save to device** stores it in the device's own memory.
+    - **Paint individual keys or LEDs** on the device's real layout (a keyboard grid, or LED strips by zone). Painted keys sit on top of the synced effect.
+  - Brightness, per-device on/off, LED counts for addressable headers, and quiet hours.
 - **Profiles and automation.** Save complete setups and switch automatically while a program runs (for example, a game).
 - **Lightweight.** A small native app that lives in the tray, starts with Windows, and sends no telemetry.
 
@@ -55,7 +58,13 @@ To try Stellar without installing it, choose **No** at the install prompt (or ru
   - **Curves:** create and edit them in the library below the fan cards.
   - **Auto-tune / Re-run auto-tune:** measures your fans.
   - **Rebuild curves:** re-applies tuning without a new sweep, for example after switching **CPU cooler** between Air and AIO.
-- **Lighting:** global effect, per-device effects, LED counts for addressable headers, and quiet hours.
+- **Lighting:** the global synced effect and quiet hours. Each device has its own card:
+  - choose **Stellar** (synced) or **the device's built-in effects**;
+  - give a device its own effect;
+  - paint keys and LEDs: drag to paint, right-drag to erase, **Fill all** or **Clear painted**;
+  - set LED counts for addressable headers.
+
+  Per-key colours are applied live by Stellar. Only built-in effects can be saved onto the device itself (an OpenRGB limit).
 - **Profiles & automation:** save and apply complete setups, or switch automatically while a program runs.
 - **Tray:** click to open, right-click for lighting on/off, profiles and Quit. The icon turns red while a safety override is active.
 

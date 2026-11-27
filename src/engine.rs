@@ -32,6 +32,8 @@ pub enum Cmd {
     RebuildCurves(crate::config::CpuCooler),
     SetLighting(bool),
     ReconnectLighting,
+    /// Store a device's configured built-in effect in its own memory.
+    SaveToDevice(String),
     Quit,
 }
 
@@ -272,6 +274,10 @@ impl Engine {
                     }
                     self.commit(new)?;
                     None
+                }
+                Cmd::SaveToDevice(device) => {
+                    self.lighting.save_onboard(&self.settings.lighting, &device)?;
+                    Some(format!("Saved to {device} — it keeps this effect even without Stellar"))
                 }
                 Cmd::ReconnectLighting => {
                     self.lighting.reconnect();

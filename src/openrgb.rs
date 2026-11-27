@@ -14,6 +14,28 @@ const RESIZE_ZONE: u32 = 1000;
 const UPDATE_LEDS: u32 = 1050;
 const SET_CUSTOM_MODE: u32 = 1100;
 const UPDATE_MODE: u32 = 1101;
+const SAVE_MODE: u32 = 1102;
+
+pub const FLAG_HAS_SPEED: u32 = 1 << 0;
+pub const FLAG_HAS_DIRECTION_LR: u32 = 1 << 1;
+pub const FLAG_HAS_DIRECTION_UD: u32 = 1 << 2;
+pub const FLAG_HAS_DIRECTION_HV: u32 = 1 << 3;
+pub const FLAG_HAS_RANDOM_COLOR: u32 = 1 << 7;
+pub const COLOR_MODE_RANDOM: u32 = 3;
+pub const FLAG_HAS_BRIGHTNESS: u32 = 1 << 4;
+pub const FLAG_HAS_PER_LED_COLOR: u32 = 1 << 5;
+pub const FLAG_HAS_MODE_SPECIFIC_COLOR: u32 = 1 << 6;
+pub const FLAG_MANUAL_SAVE: u32 = 1 << 8;
+pub const COLOR_MODE_SPECIFIC: u32 = 2;
+pub const NO_LED: u32 = u32::MAX;
+
+/// OpenRGB packs colours as 0x00BBGGRR.
+pub fn pack(c: [u8; 3]) -> u32 {
+    c[0] as u32 | (c[1] as u32) << 8 | (c[2] as u32) << 16
+}
+pub fn unpack(v: u32) -> [u8; 3] {
+    [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mode {
@@ -40,6 +62,8 @@ pub struct Zone {
     pub leds_min: u32,
     pub leds_max: u32,
     pub leds_count: u32,
+    /// Physical layout: (height, width, row-major LED indices, NO_LED for gaps).
+    pub matrix: Option<(u32, u32, Vec<u32>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +76,7 @@ pub struct Device {
     pub active_mode: i32,
     pub zones: Vec<Zone>,
     pub led_count: usize,
+    pub led_names: Vec<String>,
 }
 
 struct Reader<'a> {
@@ -124,15 +149,27 @@ pub fn parse_device(b: &[u8]) -> Result<Device> {
         let leds_max = r.u32()?;
         let leds_count = r.u32()?;
         let matrix_len = r.u16()? as usize;
-        r.take(matrix_len)?;
-        zones.push(Zone { name, kind, leds_min, leds_max, leds_count });
+        let matrix = if matrix_len >= 8 {
+            let h = r.u32()?;
+            let w = r.u32()?;
+            let cells = (matrix_len - 8) / 4;
+            if (h as usize).saturating_mul(w as usize) != cells {
+                bail!("bad zone matrix");
+            }
+            Some((h, w, (0..cells).map(|_| r.u32()).collect::<Result<_>>()?))
+        } else {
+            r.take(matrix_len)?;
+            None
+        };
+        zones.push(Zone { name, kind, leds_min, leds_max, leds_count, matrix });
     }
     let n_leds = r.u16()? as usize;
+    let mut led_names = Vec::with_capacity(n_leds);
     for _ in 0..n_leds {
-        r.str()?;
+        led_names.push(r.str()?);
         r.u32()?;
     }
-    Ok(Device { kind, name, vendor, description, modes, active_mode, zones, led_count: n_leds })
+    Ok(Device { kind, name, vendor, description, modes, active_mode, zones, led_count: n_leds, led_names })
 }
 
 pub fn encode_mode(index: i32, m: &Mode) -> Vec<u8> {
@@ -253,6 +290,11 @@ impl Client {
         self.send(dev, UPDATE_MODE, &encode_mode(index, mode))
     }
 
+    /// Store a mode in the device's own memory so it persists without software.
+    pub fn save_mode(&mut self, dev: u32, index: i32, mode: &Mode) -> Result<()> {
+        self.send(dev, SAVE_MODE, &encode_mode(index, mode))
+    }
+
     pub fn update_leds(&mut self, dev: u32, colors: &[[u8; 3]]) -> Result<()> {
         self.send(dev, UPDATE_LEDS, &encode_leds(colors))
     }
@@ -289,7 +331,10 @@ mod tests {
         for v in [0u32, 120, 60] {
             b.extend(v.to_le_bytes());
         }
-        b.extend(0u16.to_le_bytes());
+        b.extend(16u16.to_le_bytes()); // 2x1 matrix: height, width, two cells
+        for v in [1u32, 2, 0, NO_LED] {
+            b.extend(v.to_le_bytes());
+        }
         b.extend(2u16.to_le_bytes());
         for _ in 0..2 {
             s(&mut b, "LED");
@@ -302,6 +347,10 @@ mod tests {
         assert_eq!(d.zones[0].leds_count, 60);
         assert_eq!(d.zones[0].leds_max, 120);
         assert_eq!(d.led_count, 2);
+        assert_eq!(d.led_names, vec!["LED", "LED"]);
+        assert_eq!(d.zones[0].matrix, Some((1, 2, vec![0, NO_LED])));
+        assert_eq!(unpack(pack([1, 2, 3])), [1, 2, 3]);
+        assert_eq!(pack([0xff, 0, 0]), 0xff, "red is the low byte");
         assert!(parse_device(&b[..b.len() - 9]).is_err(), "truncated packet rejected");
     }
 

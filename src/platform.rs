@@ -30,6 +30,17 @@ fn shared_attributes() -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
     }
 }
 
+/// The primary screen's usable area (excluding the taskbar) in logical points.
+pub fn work_area() -> Option<(f32, f32)> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let ok = unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut RECT as *mut _, 0) } != 0;
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32;
+    (ok && r.right > r.left && r.bottom > r.top)
+        .then(|| ((r.right - r.left) as f32 * 96.0 / dpi, (r.bottom - r.top) as f32 * 96.0 / dpi))
+}
+
 pub fn is_admin() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }

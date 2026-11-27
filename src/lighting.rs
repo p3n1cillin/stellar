@@ -1,8 +1,11 @@
 //! Lighting engine: renders effects in Stellar and streams them to every
 //! OpenRGB device, so ASUS Aura, Corsair and other controllers stay in sync.
 
-use crate::config::{Effect, LightingSettings, Rgb, local_app_data};
-use crate::openrgb::{Client, Device};
+use crate::config::{Effect, LightingSettings, OnboardMode, Rgb, local_app_data};
+use crate::openrgb::{
+    COLOR_MODE_RANDOM, COLOR_MODE_SPECIFIC, Client, Device, FLAG_HAS_BRIGHTNESS, FLAG_HAS_DIRECTION_HV, FLAG_HAS_DIRECTION_LR,
+    FLAG_HAS_DIRECTION_UD, FLAG_HAS_MODE_SPECIFIC_COLOR, FLAG_HAS_RANDOM_COLOR, FLAG_HAS_SPEED, Mode, Zone, pack,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -70,7 +73,51 @@ pub fn effective<'a>(s: &'a LightingSettings, device: &str, quiet: bool) -> &'a 
 pub fn frame(s: &LightingSettings, device: &str, leds: usize, t: f64, temps: &HashMap<String, f64>, quiet: bool) -> Vec<Rgb> {
     let e = effective(s, device, quiet);
     let k = s.brightness / 100.0;
-    (0..leds).map(|i| scale(render(e, t, i, leds, temps), k)).collect()
+    let mut out: Vec<Rgb> = (0..leds).map(|i| scale(render(e, t, i, leds, temps), k)).collect();
+    // Painted keys sit on top of the effect (but never light a device that is off).
+    if *e != Effect::Off
+        && let Some(d) = s.devices.get(device)
+    {
+        for (&i, &c) in &d.keys {
+            if let Some(slot) = out.get_mut(i as usize) {
+                *slot = scale(c, k);
+            }
+        }
+    }
+    out
+}
+
+/// The device's built-in mode configured by `ob`, with its index.
+pub fn onboard_mode(d: &Device, ob: &OnboardMode) -> Option<(usize, Mode)> {
+    let i = d.modes.iter().position(|m| m.name == ob.mode)?;
+    let mut m = d.modes[i].clone();
+    let fit = |v: u32, a: u32, b: u32| v.clamp(a.min(b), a.max(b));
+    if m.flags & FLAG_HAS_SPEED != 0
+        && let Some(v) = ob.speed
+    {
+        m.speed = fit(v, m.speed_min, m.speed_max);
+    }
+    if m.flags & FLAG_HAS_BRIGHTNESS != 0
+        && let Some(v) = ob.brightness
+    {
+        m.brightness = fit(v, m.brightness_min, m.brightness_max);
+    }
+    if m.flags & (FLAG_HAS_DIRECTION_LR | FLAG_HAS_DIRECTION_UD | FLAG_HAS_DIRECTION_HV) != 0
+        && let Some(v) = ob.direction
+    {
+        m.direction = v.min(5);
+    }
+    if ob.random && m.flags & FLAG_HAS_RANDOM_COLOR != 0 {
+        m.color_mode = COLOR_MODE_RANDOM;
+    } else if m.flags & FLAG_HAS_MODE_SPECIFIC_COLOR != 0 && !ob.colors.is_empty() {
+        // Respect the device's colour count: pad by repeating, trim extras.
+        let lo = m.colors_min.max(1) as usize;
+        let hi = (m.colors_max as usize).max(lo);
+        let n = ob.colors.len().clamp(lo, hi);
+        m.color_mode = COLOR_MODE_SPECIFIC;
+        m.colors = (0..n).map(|i| pack(ob.colors[i % ob.colors.len()])).collect();
+    }
+    Some((i, m))
 }
 
 // ---------------------------------------------------------------- ownership lease
@@ -118,15 +165,68 @@ impl Lease {
 pub struct DeviceInfo {
     pub name: String,
     pub vendor: String,
+    /// OpenRGB device type (5 = keyboard, 6 = mouse, 1 = RAM, …); see `kind_label`.
+    pub kind: i32,
     pub leds: usize,
     pub zones: Vec<(String, u32, u32, u32)>, // name, count, min, max
+    /// Zones with LED ranges and optional physical layout, for per-LED painting.
+    pub layout: Vec<Zone>,
+    pub led_names: Vec<String>,
+    /// Built-in effects (excluding Direct/Off, which Stellar handles itself).
+    pub modes: Vec<Mode>,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+/// Settings key per device: its name, or "Name (2)", "Name (3)"… when several
+/// devices share a name (common for identical RAM sticks or fans).
+pub fn device_keys(names: &[&str]) -> Vec<String> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    names
+        .iter()
+        .map(|n| {
+            let c = seen.entry(n).or_insert(0);
+            *c += 1;
+            if *c == 1 { n.to_string() } else { format!("{n} ({c})") }
+        })
+        .collect()
+}
+
+pub fn kind_label(kind: i32) -> &'static str {
+    match kind {
+        0 => "Motherboard",
+        1 => "Memory",
+        2 => "Graphics card",
+        3 => "Cooler",
+        4 => "LED strip",
+        5 => "Keyboard",
+        6 => "Mouse",
+        7 => "Mousemat",
+        8 => "Headset",
+        9 => "Headset stand",
+        10 => "Gamepad",
+        11 => "Light",
+        12 => "Speaker",
+        14 => "Storage",
+        15 => "Case",
+        16 => "Microphone",
+        17 => "Accessory",
+        18 => "Keypad",
+        _ => "Device",
+    }
+}
+
+/// Modes Stellar shows as "built-in effects": everything except per-LED
+/// direct control and off, which Stellar's own engine already provides.
+pub fn is_builtin_effect(m: &Mode) -> bool {
+    let n = m.name.to_lowercase();
+    !(n == "direct" || n == "custom" || n == "static custom" || n == "off" || n == "static" && m.flags & crate::openrgb::FLAG_HAS_PER_LED_COLOR != 0)
+}
+
+#[derive(PartialEq, Clone)]
 enum Applied {
     Unknown,
     Custom,
     OffMode,
+    Onboard(Mode),
 }
 
 pub struct Lighting {
@@ -171,13 +271,22 @@ impl Lighting {
     pub fn devices(&self) -> Vec<DeviceInfo> {
         self.devices
             .iter()
-            .map(|d| DeviceInfo {
-                name: d.name.clone(),
+            .zip(self.keys())
+            .map(|(d, key)| DeviceInfo {
+                name: key,
                 vendor: d.vendor.clone(),
+                kind: d.kind,
                 leds: d.led_count,
                 zones: d.zones.iter().map(|z| (z.name.clone(), z.leds_count, z.leds_min, z.leds_max)).collect(),
+                layout: d.zones.clone(),
+                led_names: d.led_names.clone(),
+                modes: d.modes.iter().filter(|m| is_builtin_effect(m)).cloned().collect(),
             })
             .collect()
+    }
+
+    fn keys(&self) -> Vec<String> {
+        device_keys(&self.devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>())
     }
 
     /// Whether this engine holds a connection, lock or server.
@@ -301,9 +410,11 @@ impl Lighting {
         if resend {
             self.last_resend = Instant::now();
         }
+        let keys = self.keys();
         let c = self.client.as_mut().expect("prepared");
         for (i, d) in self.devices.iter().enumerate() {
-            let e = effective(s, &d.name, quiet);
+            let key = &keys[i];
+            let e = effective(s, key, quiet);
             let off_mode = d.modes.iter().position(|m| m.name.eq_ignore_ascii_case("off"));
             if *e == Effect::Off
                 && let Some(m) = off_mode
@@ -311,6 +422,18 @@ impl Lighting {
                 if self.applied[i] != Applied::OffMode || resend {
                     c.update_mode(i as u32, m as i32, &d.modes[m])?;
                     self.applied[i] = Applied::OffMode;
+                    self.last[i].clear();
+                }
+                continue;
+            }
+            if let Some(ob) = s.devices.get(key).and_then(|x| x.onboard.as_ref())
+                && let Some((mi, mode)) = onboard_mode(d, ob)
+            {
+                // The device renders its own effect; resend only on change.
+                let want = Applied::Onboard(mode.clone());
+                if self.applied[i] != want {
+                    c.update_mode(i as u32, mi as i32, &mode)?;
+                    self.applied[i] = want;
                     self.last[i].clear();
                 }
                 continue;
@@ -323,7 +446,7 @@ impl Lighting {
             if d.led_count == 0 {
                 continue;
             }
-            let colors = frame(s, &d.name, d.led_count, t, temps, quiet);
+            let colors = frame(s, key, d.led_count, t, temps, quiet);
             if colors != self.last[i] || resend {
                 c.update_leds(i as u32, &colors)?;
                 self.last[i] = colors;
@@ -335,6 +458,23 @@ impl Lighting {
             self.ok = true;
             crate::log(&format!("Lighting connected: {}", self.status));
         }
+        Ok(())
+    }
+
+    /// Store the device's configured built-in effect in its own memory.
+    pub fn save_onboard(&mut self, s: &LightingSettings, device: &str) -> Result<()> {
+        let ob = s.devices.get(device).and_then(|d| d.onboard.as_ref()).ok_or_else(|| anyhow!("Choose a built-in effect first"))?;
+        let i = self.keys().iter().position(|k| k == device).ok_or_else(|| anyhow!("{device} is not connected"))?;
+        let c = self.client.as_mut().ok_or_else(|| anyhow!("Lighting isn't connected"))?;
+        let d = &self.devices[i];
+        let (mi, mode) = onboard_mode(d, ob).ok_or_else(|| anyhow!("{device} has no mode called {}", ob.mode))?;
+        if mode.flags & crate::openrgb::FLAG_MANUAL_SAVE == 0 {
+            bail!("{device} can't store effects in its own memory");
+        }
+        c.update_mode(i as u32, mi as i32, &mode)?;
+        c.save_mode(i as u32, mi as i32, &mode)?;
+        self.applied[i] = Applied::Onboard(mode);
+        crate::log(&format!("Saved {} to {device}", ob.mode));
         Ok(())
     }
 
@@ -373,8 +513,8 @@ mod tests {
     #[test]
     fn device_overrides_quiet_and_brightness() {
         let mut s = LightingSettings { brightness: 50.0, effect: Effect::Static { color: [200, 0, 0] }, ..Default::default() };
-        s.devices.insert("B".into(), DeviceLighting { enabled: true, effect: Some(Effect::Static { color: [0, 200, 0] }) });
-        s.devices.insert("C".into(), DeviceLighting { enabled: false, effect: None });
+        s.devices.insert("B".into(), DeviceLighting { effect: Some(Effect::Static { color: [0, 200, 0] }), ..Default::default() });
+        s.devices.insert("C".into(), DeviceLighting { enabled: false, ..Default::default() });
         let n = HashMap::new();
         assert_eq!(frame(&s, "A", 2, 0.0, &n, false), vec![[100, 0, 0]; 2]);
         assert_eq!(frame(&s, "B", 1, 0.0, &n, false), vec![[0, 100, 0]]);
@@ -383,6 +523,43 @@ mod tests {
         s.on = false;
         assert_eq!(*effective(&s, "B", false), Effect::Off);
         let _ = QuietHours { start_min: 0, end_min: 0 };
+    }
+
+    #[test]
+    fn duplicate_device_names_get_their_own_keys() {
+        assert_eq!(device_keys(&["RAM", "GPU", "RAM", "RAM"]), vec!["RAM", "GPU", "RAM (2)", "RAM (3)"]);
+    }
+
+    #[test]
+    fn painted_keys_overlay_the_effect() {
+        let mut s = LightingSettings { brightness: 100.0, effect: Effect::Static { color: [0, 0, 255] }, ..Default::default() };
+        let mut d = DeviceLighting::default();
+        d.keys.insert(1, [255, 0, 0]);
+        d.keys.insert(99, [255, 0, 0]); // beyond the device: ignored
+        s.devices.insert("KB".into(), d);
+        let n = HashMap::new();
+        assert_eq!(frame(&s, "KB", 3, 0.0, &n, false), vec![[0, 0, 255], [255, 0, 0], [0, 0, 255]]);
+        assert_eq!(frame(&s, "KB", 3, 0.0, &n, true), vec![[0, 0, 0]; 3], "quiet hours turn painted keys off too");
+    }
+
+    #[test]
+    fn onboard_modes_respect_device_limits() {
+        use crate::openrgb::*;
+        let mode = Mode {
+            name: "Breathing".into(), value: 2, flags: FLAG_HAS_SPEED | FLAG_HAS_MODE_SPECIFIC_COLOR | FLAG_HAS_DIRECTION_LR,
+            speed_min: 255, speed_max: 0, brightness_min: 0, brightness_max: 0, colors_min: 1, colors_max: 2,
+            speed: 127, brightness: 0, direction: 0, color_mode: 0, colors: vec![],
+        };
+        let dev = Device { kind: 5, name: "KB".into(), vendor: String::new(), description: String::new(), modes: vec![mode], active_mode: 0, zones: vec![], led_count: 0, led_names: vec![] };
+        let ob = OnboardMode { mode: "Breathing".into(), speed: Some(999), brightness: Some(50), direction: Some(1), colors: vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]], random: false };
+        let (i, m) = onboard_mode(&dev, &ob).unwrap();
+        assert_eq!(i, 0);
+        assert_eq!(m.speed, 255, "reversed speed range is clamped");
+        assert_eq!(m.brightness, 0, "brightness ignored without the flag");
+        assert_eq!(m.direction, 1);
+        assert_eq!(m.colors, vec![pack([255, 0, 0]), pack([0, 255, 0])], "trimmed to the device's maximum colours");
+        assert_eq!(m.color_mode, COLOR_MODE_SPECIFIC);
+        assert!(onboard_mode(&dev, &OnboardMode { mode: "Nope".into(), ..Default::default() }).is_none());
     }
 
     #[test]
