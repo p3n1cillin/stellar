@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 config.json
+native/bin/
+native/obj/
+
+# Stellar
+stellar/target/
+stellar/dist/
+stellar/hwhost/bin/
+stellar/hwhost/obj/
