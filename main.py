@@ -16,8 +16,14 @@ gray = off, red = can't reach OpenRGB.
 """
 
 import json
+import logging
+import os
+import shutil
+import subprocess
 import sys
 import threading
+import time
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -25,11 +31,15 @@ import pystray
 from openrgb import OpenRGBClient
 from openrgb.utils import RGBColor
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+LEGACY_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+SETTINGS_DIR = Path(os.environ.get("LOCALAPPDATA", str(LEGACY_CONFIG_PATH.parent))) / "RGBTrayController"
+CONFIG_PATH = SETTINGS_DIR / "config.json"
+CONFIG_LOCK = threading.RLock()
 DEFAULT_COLOR = (0, 120, 255)
 DISCONNECTED_COLOR = (200, 40, 40)
 OFF_COLOR = (60, 60, 60)
 ICON_SIZE = 64
+OPENRGB_STARTUP_TIMEOUT = 15.0
 
 PRESET_COLORS = [
     ("Red", (255, 0, 0)),
@@ -45,26 +55,62 @@ PRESET_COLORS = [
 
 
 def load_config():
-    """Returns (color_tuple, is_on). Falls back to defaults on any bad/missing file."""
-    if CONFIG_PATH.exists():
+    """Returns (color_tuple, is_on, zone_sizes), with safe defaults."""
+    paths = (CONFIG_PATH, CONFIG_PATH.with_suffix(".json.bak"), LEGACY_CONFIG_PATH)
+    for path in paths:
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            color = tuple(int(c) for c in data.get("color", DEFAULT_COLOR))
-            on = bool(data.get("on", True))
-            if len(color) == 3 and all(0 <= c <= 255 for c in color):
-                return color, on
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Settings must be an object")
+            color = data.get("color", DEFAULT_COLOR)
+            on = data.get("on", True)
+            if (not isinstance(color, (list, tuple)) or len(color) != 3
+                    or any(type(c) is not int or not 0 <= c <= 255 for c in color)
+                    or type(on) is not bool):
+                raise ValueError("Invalid color or on/off state")
+            zone_sizes = data.get("zone_sizes", {})
+            if not isinstance(zone_sizes, dict):
+                zone_sizes = {}
+            zone_sizes = {
+                device: {zone: size for zone, size in zones.items()
+                         if isinstance(zone, str) and type(size) is int and 0 <= size <= 10000}
+                for device, zones in zone_sizes.items()
+                if isinstance(device, str) and isinstance(zones, dict)
+            }
+            if path != CONFIG_PATH:
+                save_config(tuple(color), on, zone_sizes)
+            return tuple(color), on, zone_sizes
         except (json.JSONDecodeError, OSError, ValueError, TypeError):
-            pass
-    return DEFAULT_COLOR, True
+            continue
+    return DEFAULT_COLOR, True, {}
 
 
-def save_config(color, on):
+def _atomic_write(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
     try:
-        CONFIG_PATH.write_text(
-            json.dumps({"color": list(color), "on": on}), encoding="utf-8"
-        )
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name, suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_config(color, on, zone_sizes):
+    payload = json.dumps({"color": list(color), "on": on, "zone_sizes": zone_sizes}, indent=2)
+    try:
+        with CONFIG_LOCK:
+            _atomic_write(CONFIG_PATH, payload)
+            _atomic_write(CONFIG_PATH.with_suffix(".json.bak"), payload)
+        return True
     except OSError:
-        pass
+        logging.exception("Could not save RGB settings")
+        return False
 
 
 class RGBController:
@@ -76,23 +122,83 @@ class RGBController:
     started or restarted at any time relative to this app.
     """
 
-    def __init__(self):
+    def __init__(self, zone_sizes=None):
         self._client = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._server_process = None
+        self._server_start_attempted = False
+        self._zone_sizes = zone_sizes or {}
 
     def is_connected(self):
-        return self._client is not None
+        with self._lock:
+            return self._client is not None
+
+    @staticmethod
+    def _find_openrgb():
+        """Find an OpenRGB executable installed on Windows."""
+        configured = os.environ.get("OPENRGB_PATH")
+        candidates = [configured, shutil.which("OpenRGB")]
+        for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+            base = os.environ.get(env_name)
+            if base:
+                candidates.append(str(Path(base) / "OpenRGB" / "OpenRGB.exe"))
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return candidate
+        return None
+
+    def _try_connect(self):
+        try:
+            self._client = OpenRGBClient(name="RGB Tray Controller")
+            return True
+        except Exception:
+            self._client = None
+            return False
+
+    def _start_openrgb_server(self):
+        """Start a local SDK server when OpenRGB is installed but not enabled."""
+        if sys.platform != "win32":
+            return False
+        if self._server_process is not None and self._server_process.poll() is None:
+            return False
+        self._server_start_attempted = True
+        executable = self._find_openrgb()
+        if executable is None:
+            return False
+
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        try:
+            self._server_process = subprocess.Popen(
+                [executable, "--server", "--server-host", "127.0.0.1"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return True
+        except OSError:
+            self._server_process = None
+            return False
 
     def connect(self):
         with self._lock:
             if self._client is not None:
                 return True
-            try:
-                self._client = OpenRGBClient(name="RGB Tray Controller")
+            if self._try_connect():
                 return True
-            except Exception:
-                self._client = None
+            if not self._start_openrgb_server():
                 return False
+            deadline = time.monotonic() + OPENRGB_STARTUP_TIMEOUT
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                if self._try_connect():
+                    return True
+                if self._server_process.poll() is not None:
+                    break
+            return False
 
     def disconnect(self):
         with self._lock:
@@ -104,54 +210,91 @@ class RGBController:
                 pass
             self._client = None
 
+    def close(self):
+        """Release the SDK client and a server process started by this app."""
+        self.disconnect()
+        process = self._server_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self._server_process = None
+
     def _live_devices(self):
         """Refreshed device list, or [] on any failure (also drops the stale connection)."""
         if self._client is None:
             return []
         try:
             self._client.update()
-            return list(self._client.devices)
+            devices = list(self._client.devices)
+            resized = False
+            for device in devices:
+                configured_zones = self._zone_sizes.get(device.name, {})
+                if not isinstance(configured_zones, dict):
+                    continue
+                for zone in device.zones:
+                    size = configured_zones.get(zone.name)
+                    if isinstance(size, int) and size >= 0 and len(zone.leds) != size:
+                        zone.resize(size)
+                        resized = True
+            if resized:
+                self._client.update()
+                devices = list(self._client.devices)
+            return devices
         except Exception:
-            self.disconnect()
+            try:
+                self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
             return []
 
     def set_color(self, rgb):
-        if not self.is_connected() and not self.connect():
-            return False
-        devices = self._live_devices()
-        if not devices:
-            return False
-        color = RGBColor(*rgb)
-        ok = True
-        for device in devices:
-            try:
-                device.set_color(color)
-            except Exception:
-                ok = False
-        return ok
+        with self._lock:
+            if not self.connect():
+                return False
+            devices = self._live_devices()
+            if not devices:
+                return False
+            color = RGBColor(*rgb)
+            ok = True
+            for device in devices:
+                try:
+                    # A device in its hardware Off mode ignores color updates.
+                    # Custom mode selects its most granular controllable mode
+                    # (normally Direct), restoring it before applying the color.
+                    device.set_custom_mode()
+                    device.set_color(color)
+                except Exception:
+                    ok = False
+            return ok
 
     def turn_off(self):
         """Prefers each device's own "Off" mode when it has one (true hardware
         off, e.g. fully disabling a motherboard header) and falls back to a
         black Direct color otherwise (most peripherals only ever expose
         Direct/Static/Effect modes, never a real Off)."""
-        if not self.is_connected() and not self.connect():
-            return False
-        devices = self._live_devices()
-        if not devices:
-            return False
-        ok = True
-        for device in devices:
-            try:
-                device.set_mode("Off")  # raises ValueError if this device has no Off mode
-            except ValueError:
+        with self._lock:
+            if not self.connect():
+                return False
+            devices = self._live_devices()
+            if not devices:
+                return False
+            ok = True
+            for device in devices:
                 try:
-                    device.set_color(RGBColor(0, 0, 0))
+                    device.set_mode("Off")  # raises ValueError if no Off mode exists
+                except ValueError:
+                    try:
+                        device.set_custom_mode()
+                        device.set_color(RGBColor(0, 0, 0))
+                    except Exception:
+                        ok = False
                 except Exception:
                     ok = False
-            except Exception:
-                ok = False
-        return ok
+            return ok
 
 
 def make_icon_image(rgb):
@@ -169,30 +312,33 @@ def make_icon_image(rgb):
 
 class TrayApp:
     def __init__(self):
-        self.controller = RGBController()
-        self.color, self.on = load_config()
+        self.color, self.on, self.zone_sizes = load_config()
+        self.controller = RGBController(self.zone_sizes)
+        self._state_lock = threading.RLock()
+        self._changed = threading.Event()
+        self._stopping = threading.Event()
+        self._applied = False
+        self._save_ok = True
+        self._worker = None
+        self.dashboard = None
         self.icon = pystray.Icon(
             "rgb-tray-app",
             make_icon_image(OFF_COLOR),
-            "RGB Tray Controller — starting...",
+            "Cooling & Lighting — starting...",
             menu=self._build_menu(),
         )
 
-    def _display_color(self):
-        if not self.controller.is_connected() and self.on:
-            # Only shown briefly: refreshed to the real state right after connect() runs.
-            return DISCONNECTED_COLOR
-        return self.color if self.on else OFF_COLOR
-
     def _refresh_icon(self):
-        connected = self.controller.is_connected()
         color = self.color if self.on else OFF_COLOR
-        if self.on and not connected:
+        if not self._applied or not self._save_ok:
             color = DISCONNECTED_COLOR
         self.icon.icon = make_icon_image(color)
         state = "on" if self.on else "off"
-        conn = "connected" if connected else "OpenRGB not found"
-        self.icon.title = f"RGB Tray Controller — {state} ({conn})"
+        conn = "applied" if self._applied else "waiting for OpenRGB"
+        if not self._save_ok:
+            conn = "settings could not be saved"
+        self.icon.title = f"Cooling & Lighting — {state} ({conn})"
+        self.icon.update_menu()
 
     def _build_menu(self):
         color_items = tuple(
@@ -200,10 +346,10 @@ class TrayApp:
             for name, rgb in PRESET_COLORS
         )
         return pystray.Menu(
+            pystray.MenuItem("Open Cooling & Lighting", self._open_dashboard, default=True),
             pystray.MenuItem(
                 lambda item: "Turn Off" if self.on else "Turn On",
                 self._toggle,
-                default=True,
             ),
             pystray.MenuItem("Colors", pystray.Menu(*color_items)),
             pystray.MenuItem("Custom Color...", self._custom_color),
@@ -218,72 +364,117 @@ class TrayApp:
             self._apply_color(rgb)
         return handler
 
-    def _apply_color(self, rgb):
-        self.color = rgb
-        self.on = True
-        threading.Thread(target=self.controller.set_color, args=(rgb,), daemon=True).start()
-        save_config(self.color, self.on)
+    def _save_and_schedule(self):
+        self._save_ok = save_config(self.color, self.on, self.zone_sizes)
+        self._applied = False
+        self._changed.set()
         self._refresh_icon()
+
+    def _work(self):
+        """One worker applies the latest selection and recovers after SDK restarts."""
+        while not self._stopping.is_set():
+            requested = self._changed.wait(timeout=5)
+            if self._stopping.is_set():
+                break
+            self._changed.clear()
+            if self.dashboard:
+                self.dashboard.monitor()
+            with self._state_lock:
+                color, on = self.color, self.on
+            try:
+                if not requested and self._applied:
+                    with self.controller._lock:
+                        healthy = bool(self.controller._live_devices())
+                    if healthy:
+                        continue
+                success = (self.controller.set_color(color) if on
+                           else self.controller.turn_off())
+                if not success:
+                    self.controller.disconnect()
+                with self._state_lock:
+                    self._applied = success and (color, on) == (self.color, self.on)
+            except Exception:
+                logging.exception("Could not apply RGB state")
+                self._applied = False
+                self.controller.disconnect()
+            if not self._stopping.is_set():
+                self._refresh_icon()
+
+    def _apply_color(self, rgb):
+        with self._state_lock:
+            self.color = rgb
+            self.on = True
+            self._save_and_schedule()
 
     def _toggle(self, icon, item):
-        if self.on:
-            self.on = False
-            threading.Thread(target=self.controller.turn_off, daemon=True).start()
-        else:
-            self.on = True
-            threading.Thread(target=self.controller.set_color, args=(self.color,), daemon=True).start()
-        save_config(self.color, self.on)
-        self._refresh_icon()
+        with self._state_lock:
+            self.on = not self.on
+            self._save_and_schedule()
 
     def _custom_color(self, icon, item):
-        # tkinter's color chooser must run on its own thread with its own Tk
-        # root — pystray's menu callback thread is not a GUI thread and must
-        # not be blocked waiting on it, or the tray stops responding.
-        def pick():
-            import tkinter as tk
-            from tkinter import colorchooser
+        if self.dashboard:
+            self.dashboard.commands.put(("color", None))
 
-            root = tk.Tk()
-            root.withdraw()
-            result = colorchooser.askcolor(
-                color="#%02x%02x%02x" % self.color, title="Choose RGB color"
-            )
-            root.destroy()
-            rgb = result[0]
-            if rgb is not None:
-                self._apply_color(tuple(int(c) for c in rgb))
-
-        threading.Thread(target=pick, daemon=True).start()
+    def _open_dashboard(self, icon, item):
+        if self.dashboard:
+            self.dashboard.commands.put(("show", None))
 
     def _reconnect(self, icon, item):
-        def do_reconnect():
-            self.controller.disconnect()
-            self.controller.connect()
-            self._refresh_icon()
-            if self.on:
-                self.controller.set_color(self.color)
-        threading.Thread(target=do_reconnect, daemon=True).start()
+        self._applied = False
+        self._changed.set()
 
     def _quit(self, icon, item):
+        self._stopping.set()
+        self._changed.set()
         self.icon.stop()
+        if self.dashboard:
+            self.dashboard.commands.put(("quit", None))
 
     def _startup(self, icon):
         icon.visible = True
-        self.controller.connect()
-        self._refresh_icon()
-        if self.on:
-            threading.Thread(target=self.controller.set_color, args=(self.color,), daemon=True).start()
-        else:
-            threading.Thread(target=self.controller.turn_off, daemon=True).start()
+        self._changed.set()
+        self._worker = threading.Thread(target=self._work, daemon=True)
+        self._worker.start()
 
     def run(self):
-        self.icon.run(setup=self._startup)
+        from dashboard import Dashboard
+        self.dashboard = Dashboard(self, SETTINGS_DIR, _atomic_write)
+        tray = threading.Thread(target=self.icon.run, kwargs={"setup": self._startup}, daemon=True)
+        tray.start()
+        try:
+            if "--show" in sys.argv:
+                self.dashboard.show()
+            self.dashboard.run()
+        finally:
+            self._stopping.set()
+            self._changed.set()
+            self.icon.stop()
+            if self._worker:
+                self._worker.join(timeout=20)
+            self.controller.close()
 
 
 def main():
     if sys.platform != "win32":
         print("This tray app targets Windows; other platforms are untested.", file=sys.stderr)
-    TrayApp().run()
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=SETTINGS_DIR / "app.log", level=logging.WARNING,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    # Windows releases this lock even on shutdown or abrupt process termination.
+    with (SETTINGS_DIR / "app.lock").open("a+b") as lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+            if os.fstat(lock_file.fileno()).st_size == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                if "--show" in sys.argv:
+                    _atomic_write(SETTINGS_DIR / "show.request", "show")
+                return
+        TrayApp().run()
 
 
 if __name__ == "__main__":
